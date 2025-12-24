@@ -1,0 +1,11 @@
+#!/bin/bash
+
+echo "Syncing uv environment..."
+source /root/.venv/bin/activate
+uv sync --active
+# uv sync --active --no-install-package flash-attn
+# uv sync --active --no-build-isolation
+uv add --active "huggingface_hub" "wandb"
+export HF_HOME="/root/hf"
+hf auth login --token $RUNPOD_HF_TOKEN --add-to-git-credential
+wandb login $RUNPOD_WANDB_TOKEN
