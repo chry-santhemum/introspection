@@ -151,7 +151,7 @@ def extract_concept_vectors(
     idx = 0
     while idx < len(formatted):
         print(f"Progress: {idx}/{len(formatted)}")
-        acts = process_batch(idx)
+        acts = process_batch(idx)  # type: ignore
         all_acts.append(acts)
         idx += acts.shape[0]
 
@@ -277,7 +277,6 @@ if __name__ == "__main__":
     # %%
     # Steering with concept vectors
     from tqdm.auto import tqdm
-    from collections import defaultdict
     from utils_model import generate_steer, SteerConfig
 
     concept_vectors = torch.load("concept_vectors/concept_diff-27b-it-L43/concepts.pt", weights_only=True)
@@ -309,21 +308,21 @@ if __name__ == "__main__":
         tokens: slice,
         batch_size: int,
         **generate_kwargs,
-    ) -> dict[tuple[float, str], list[str]]:
+    ) -> dict[str, dict[float, list[str]]]:
         """Run steering for all (word, strength) combinations, batched for speed.
 
         Returns:
-            Dict mapping (strength, word) -> list of generated texts (one per trial)
+            Dict mapping word -> {strength -> [trial texts]}
         """
         device = next(model.parameters()).device
 
         # All (word, strength) combinations
         all_combinations = [(word, strength) for strength in strengths for word in words]
 
-        # Initialize results
-        results = {(s, w): [] for s in strengths for w in words}
+        # Initialize results: {word: {strength: []}}
+        results = {w: {s: [] for s in strengths} for w in words}
 
-        for trial in tqdm(range(num_trials), desc="trials"):
+        for _ in tqdm(range(num_trials), desc="trials"):
             # Process all combinations in batches
             for batch_start in range(0, len(all_combinations), batch_size):
                 batch_items = all_combinations[batch_start:batch_start + batch_size]
@@ -355,13 +354,13 @@ if __name__ == "__main__":
                 for i, (word, strength) in enumerate(batch_items):
                     full_text = tokenizer.decode(output_ids[i], skip_special_tokens=True)
                     model_text = full_text.split("\nmodel\n")[2]
-                    results[(strength, word)].append(model_text)
+                    results[word][strength].append(model_text)
 
         return results
 
     # %%
     batch_size = 128
-    num_trials = 50
+    num_trials = 128
     strengths = [1.0, 2.0, 3.0, 4.0, 6.0]
 
     all_results = batched_steer_sweep(
@@ -380,7 +379,7 @@ if __name__ == "__main__":
     )
 
     save_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}/steering.json")
-    save_path.mkdir(parents=True, exist_ok=True)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "w") as f:
         json.dump(all_results, f, indent=4, sort_keys=True)
 

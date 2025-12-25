@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Others
+.env
+.cache
+
 # Data
 concept_vectors/
 attribution/
