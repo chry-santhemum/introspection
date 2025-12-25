@@ -68,12 +68,15 @@ def get_resid_block_name(model, layer: int) -> str:
         model = model.h
     return name + f"{layer}"
 
-
-def get_layer_at_fraction(model, fraction: float) -> int:
+def get_num_layers(model) -> int:
     config = model.config
     config = getattr(config, "text_config", config)
-    layer_idx = int(config.num_hidden_layers * fraction)
-    return max(0, min(layer_idx, config.num_hidden_layers - 1))
+    return config.num_hidden_layers
+
+def get_layer_at_fraction(model, fraction: float) -> int:
+    num_layers = get_num_layers(model)
+    layer_idx = int(num_layers * fraction)
+    return max(0, min(layer_idx, num_layers - 1))
 
 
 # --- Forward hook configuration ---
@@ -87,6 +90,7 @@ class FwdHook:
     op: Literal["record", "replace", "add"]
     tokens: TokenSpec
     tensor: Optional[Tensor] = None  # will be broadcast to x[tokens]
+    grad: Optional[Tensor] = None  # populated by backward hook when allow_grad=True
 
     def __post_init__(self):
         if self.op in ("add", "replace") and self.tensor is None:
@@ -101,10 +105,14 @@ def _set_tensor(original, new_tensor):
         return (new_tensor,) + original[1:]
     return new_tensor
 
-def _apply_hook_op(h: FwdHook, tensor: Tensor) -> Optional[Tensor]:
+def _apply_hook_op(h: FwdHook, tensor: Tensor, retain_grad: bool = False) -> Optional[Tensor]:
     """Apply hook operation. Returns new tensor for add/replace, None for record.
 
     Handles forward passes using KV cache (seq_len=1).
+
+    Args:
+        retain_grad: If True and op is "record", call retain_grad() on the
+                     recorded tensor for gradient computation.
     """
     seq_len = tensor.shape[1]
     idx = h.tokens
@@ -124,6 +132,8 @@ def _apply_hook_op(h: FwdHook, tensor: Tensor) -> Optional[Tensor]:
             h.tensor = tensor[:, idx, :].clone()
         else:
             h.tensor.copy_(tensor[:, idx, :])
+        if retain_grad:
+            h.tensor.retain_grad()
         return None
 
     new_tensor = tensor.clone()
@@ -136,35 +146,65 @@ def _apply_hook_op(h: FwdHook, tensor: Tensor) -> Optional[Tensor]:
 
     return new_tensor
 
-def make_hook(h: FwdHook):
+
+def make_hook(h: FwdHook, retain_grad: bool = False):
     if h.pos == "output":
         def hook_fn(module, input, output):
-            result = _apply_hook_op(h, _get_tensor(output))
+            result = _apply_hook_op(h, _get_tensor(output), retain_grad=retain_grad)
             return _set_tensor(output, result) if result is not None else None
         return hook_fn
     else:
         def hook_fn(module, input):
-            result = _apply_hook_op(h, _get_tensor(input))
+            result = _apply_hook_op(h, _get_tensor(input), retain_grad=retain_grad)
             return _set_tensor(input, result) if result is not None else None
         return hook_fn
 
 
+def make_backward_hook(h: FwdHook):
+    """Create backward hook to capture gradients for a FwdHook."""
+    def hook_fn(module, grad_input, grad_output):
+        # grad_output is tuple, first element is the gradient w.r.t. output
+        grad_tensor = grad_output[0]
+        if grad_tensor is not None:
+            idx = h.tokens
+            # Handle same slicing as forward hook
+            h.grad = grad_tensor[:, idx, :].clone().detach()
+        return None
+    return hook_fn
+
+
 @contextmanager
-def fwd_with_hooks(hooks: list[FwdHook], model):
-    """Note: grads are disabled in this function."""
+def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
+    """Context manager for running forward pass with hooks.
+
+    Args:
+        hooks: List of hook configurations
+        model: The model to hook
+        allow_grad: If False (default), runs in inference_mode with no gradients.
+                    If True, gradients are enabled and backward hooks are
+                    registered to capture gradients for "record" ops.
+    """
     handles = []
 
     # register hooks
     for hook in hooks:
         module = get_module(model, hook.module_name)
         if hook.pos == "output":
-            handle = module.register_forward_hook(make_hook(hook))
+            handle = module.register_forward_hook(make_hook(hook, retain_grad=allow_grad))
         else:
-            handle = module.register_forward_pre_hook(make_hook(hook))
+            handle = module.register_forward_pre_hook(make_hook(hook, retain_grad=allow_grad))
         handles.append(handle)
 
-    with torch.inference_mode():
+        # Register backward hooks to capture gradients for record ops
+        if allow_grad and hook.op == "record":
+            bwd_handle = module.register_full_backward_hook(make_backward_hook(hook))
+            handles.append(bwd_handle)
+
+    if allow_grad:
         yield
+    else:
+        with torch.inference_mode():
+            yield
 
     for handle in handles:
         handle.remove()
@@ -208,7 +248,7 @@ class SteerConfig:
     strength: float | Tensor = 1.0  # scalar or [batch]
 
 
-def _scale_vec(vec: Tensor, strength: float | Tensor) -> Tensor:
+def scale_vec(vec: Tensor, strength: float | Tensor) -> Tensor:
     """Scale steering vector by strength.
 
     Args:
@@ -244,7 +284,7 @@ def fwd_steer(
         pos="output",
         op="add",
         tokens=steer_config.tokens,
-        tensor=_scale_vec(steer_config.vec, steer_config.strength),
+        tensor=scale_vec(steer_config.vec, steer_config.strength),
     )
 
     all_hooks = [steer_hook]
@@ -271,7 +311,7 @@ def generate_steer(
         pos="output",
         op="add",
         tokens=steer_config.tokens,
-        tensor=_scale_vec(steer_config.vec, steer_config.strength),
+        tensor=scale_vec(steer_config.vec, steer_config.strength),
     )
 
     all_hooks = [steer_hook]
