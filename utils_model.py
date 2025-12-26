@@ -8,6 +8,11 @@ from torch import nn, Tensor
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 
+# --- Component types for attribution ---
+
+ComponentType = Literal["resid", "attn", "mlp"]
+
+
 def load_model(model_name: str, **kwargs):
     """**kwargs: Passed to AutoModelForCausalLM.from_pretrained
     
@@ -77,6 +82,28 @@ def get_layer_at_fraction(model, fraction: float) -> int:
     num_layers = get_num_layers(model)
     layer_idx = int(num_layers * fraction)
     return max(0, min(layer_idx, num_layers - 1))
+
+
+def get_all_component_names(model, components: list[ComponentType]) -> dict[tuple[ComponentType, int], str]:
+    """Get module names for all components at all layers.
+
+    Returns:
+        Dict mapping (component, layer) -> module_name
+    """
+    num_layers = get_num_layers(model)
+    result = {}
+    for layer in range(num_layers):
+        for comp in components:
+            base = get_resid_block_name(model, layer)
+            match comp:
+                case "resid":
+                    name = base
+                case "attn":
+                    name = base + ".self_attn"
+                case "mlp":
+                    name = base + ".mlp"
+            result[(comp, layer)] = name
+    return result
 
 
 # --- Forward hook configuration ---
@@ -236,6 +263,109 @@ def fwd_record_resid(
 
     # record_hook.tensor is [batch, 1, hidden], squeeze to [batch, hidden]
     return record_hook.tensor.squeeze(1)
+
+
+@dataclass
+class Activations:
+    """Activations with shape [num_layers, seq_len, hidden].
+
+    For mean activations, seq_len=1 and broadcasts to any position.
+    For recorded forward pass, seq_len=actual_seq_len.
+    """
+    resid: Float[Tensor, "num_layers seq_len hidden"]
+    attn: Float[Tensor, "num_layers seq_len hidden"]
+    mlp: Float[Tensor, "num_layers seq_len hidden"]
+
+    def get(self, component: ComponentType) -> Tensor:
+        return getattr(self, component)
+
+    def get_at(self, component: ComponentType, layer: int, pos: int) -> Tensor:
+        """Get activation at (layer, pos), broadcasting if seq_len=1."""
+        tensor = self.get(component)
+        actual_pos = 0 if tensor.shape[1] == 1 else pos
+        return tensor[layer, actual_pos, :]
+
+    def __repr__(self) -> str:
+        return (
+            f"Activations(resid={list(self.resid.shape)}, "
+            f"attn={list(self.attn.shape)}, "
+            f"mlp={list(self.mlp.shape)})"
+        )
+
+
+# Backwards compatibility alias
+ForwardResult = Activations
+
+
+def fwd_record_all(
+    model,
+    inputs: dict[str, Tensor],
+    steer_config: Optional["SteerConfig"] = None,
+    components: list[ComponentType] = ["resid", "attn", "mlp"],
+) -> Activations:
+    """Forward pass recording activations at all layers for specified components.
+
+    Args:
+        model: The model to run
+        inputs: Tokenized inputs dict
+        steer_config: Optional steering configuration
+        components: Which components to record
+
+    Returns:
+        ForwardResult with activations [num_layers, seq_len, hidden] per component
+    """
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    num_layers = get_num_layers(model)
+    seq_len = inputs["input_ids"].shape[1]
+    module_names = get_all_component_names(model, components)
+
+    # Create record hooks for all components at all layers
+    record_hooks = {
+        key: FwdHook(
+            module_name=module_name,
+            pos="output",
+            op="record",
+            tokens=slice(None),  # Record all positions
+        )
+        for key, module_name in module_names.items()
+    }
+
+    all_hooks = list(record_hooks.values())
+
+    # Add steering hook if configured
+    if steer_config:
+        steer_hook = FwdHook(
+            module_name=get_resid_block_name(model, steer_config.layer),
+            pos="output",
+            op="add",
+            tokens=steer_config.tokens,
+            tensor=scale_vec(steer_config.vec, steer_config.strength),
+        )
+        all_hooks.append(steer_hook)
+
+    with fwd_with_hooks(all_hooks, model, allow_grad=False):
+        outputs = model(**inputs)
+
+    # Collect activations: [num_layers, seq_len, hidden]
+    activations = {comp: [] for comp in components}
+    for layer in range(num_layers):
+        for comp in components:
+            hook = record_hooks[(comp, layer)]
+            act = hook.tensor[0].detach().cpu()  # [seq_len, hidden]
+            activations[comp].append(act)
+
+    result = {}
+    for comp in components:
+        result[comp] = torch.stack(activations[comp], dim=0)
+
+    hidden_dim = result[components[0]].shape[-1]
+    return Activations(
+        resid=result.get("resid", torch.zeros(num_layers, seq_len, hidden_dim)),
+        attn=result.get("attn", torch.zeros(num_layers, seq_len, hidden_dim)),
+        mlp=result.get("mlp", torch.zeros(num_layers, seq_len, hidden_dim)),
+    )
 
 
 # --- Steering wrapper ---

@@ -1,9 +1,12 @@
 {
-    "exclude": [
-        "attribution/",
-        "concept_vectors/"
-    ],
-    "extraPaths": [
-        "/workspace/caller"
-    ]
+    "typeCheckingMode": "basic",
+    "exclude": ["attribution/", "concept_vectors/"],
+    "ignore": ["attribution/", "concept_vectors/"],
+    "extraPaths": ["./caller"],
+    "reportOptionalMemberAccess": "none",
+    "reportOptionalSubscript": "none",
+    "reportPrivateImportUsage": "none",
+    "reportRedeclaration": "warning",
+    "reportArgumentType": "warning",
+    "reportOperatorIssue": "warning"
 }

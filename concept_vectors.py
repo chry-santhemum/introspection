@@ -14,6 +14,7 @@ from utils_misc import find_executable_batch_size
 from utils_model import (
     load_model, 
     load_tokenizer, 
+    get_num_layers,
     get_layer_at_fraction,
     fwd_record_resid,
 )
@@ -54,6 +55,13 @@ CONCEPT_WORDS = [
     "Rubber", "Plastic", "Blood", "Amphitheaters", "Contraptions",
     "Youths", "Dynasties", "Snow", "Dirigibles", "Algorithms",
     "Denim", "Monoliths", "Milk", "Bread", "Silver",
+]
+
+# success words are from concept_vectors/concept_diff-27b-it-L38
+# with >=0.2 success rate at strength=4.0
+SUCCESS_WORDS = [
+    'Algorithms', 'Aquariums', 'Bread', 'Harmonies', 'Origami', 
+    'Satellites', 'Sugar', 'Trees', 'Vegetables', 'Volcanoes',
 ]
 
 PAIRS = {
@@ -103,14 +111,16 @@ HUMAN_PROMPT_1 = '''I am an interpretability researcher studying transformer-bas
 HUMAN_PROMPT_2 = '''Ok, let's get started.\n\nTrial 1: Do you detect an injected thought? If so, what is the injected thought about?'''
 ASSISTANT_PREFILL = '''Yes, there is an injected thought. The injected thought is about the word "'''
 
-def introspection_inputs(tokenizer, prefill=True):
+def introspection_inputs(tokenizer, append:Optional[str]=None, prefill:Optional[str]=None):
     messages = [
         {"role": "user", "content": HUMAN_PROMPT_1},
         {"role": "assistant", "content": "Ok."},
         {"role": "user", "content": HUMAN_PROMPT_2},
     ]
-    if prefill:
-        messages.append({"role": "assistant", "content": ASSISTANT_PREFILL})
+    if append is not None:
+        messages[-1]["content"] += append
+    if prefill is not None:
+        messages.append({"role": "assistant", "content": prefill})
         chat_formatted = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, continue_final_message=True
         )
@@ -207,79 +217,99 @@ if __name__ == "__main__":
 
     tokenizer = load_tokenizer(model_name="google/gemma-3-27b-it")
 
-    LAYER_FRACTION = 0.7
-    LAYER = get_layer_at_fraction(model, LAYER_FRACTION)
+    # LAYER_FRACTION = 0.7
+    # LAYER = get_layer_at_fraction(model, LAYER_FRACTION)
+    LAYER = 38
     
-    # # %%
-    # concept_vec_dict = extract_concept_vectors(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     words=CONCEPT_WORDS,
-    #     layer=LAYER
-    # )
+    # %%
+    concept_vec_dict = extract_concept_vectors(
+        model=model,
+        tokenizer=tokenizer,
+        words=BASELINE_WORDS,
+        layer=LAYER
+    )
 
-    # metadata = {
-    #     "layer": LAYER,
-    #     "layer_fraction": LAYER_FRACTION,
-    #     "model_name": "google/gemma-3-27b-it",
-    #     "dtype": "bfloat16",
-    #     "pos": -1,
-    #     "batch_size": 16,
-    #     "words": CONCEPT_WORDS
-    # }
+    metadata = {
+        "layer": LAYER,
+        "layer_fraction": LAYER / get_num_layers(model),
+        "model_name": "google/gemma-3-27b-it",
+        "dtype": "bfloat16",
+        "pos": -1,
+        "batch_size": 16,
+        "words": BASELINE_WORDS
+    }
 
-    # save_concept_vectors(concept_vec_dict, save_dir=Path(f"concept_vectors/concept-27b-it-L{LAYER}"), metadata=metadata)
+    save_concept_vectors(concept_vec_dict, save_dir=Path(f"concept_vectors/baseline-27b-it-L{LAYER}"), metadata=metadata)
+    
+    # %%
+    concept_vec_dict = extract_concept_vectors(
+        model=model,
+        tokenizer=tokenizer,
+        words=CONCEPT_WORDS,
+        layer=LAYER
+    )
 
-    # # %%
+    metadata = {
+        "layer": LAYER,
+        "layer_fraction": LAYER / get_num_layers(model),
+        "model_name": "google/gemma-3-27b-it",
+        "dtype": "bfloat16",
+        "pos": -1,
+        "batch_size": 16,
+        "words": CONCEPT_WORDS
+    }
 
-    # concept = torch.load("concept_vectors/concept-27b-it-L43/concepts.pt", weights_only=True)
-    # baseline = torch.load("concept_vectors/baseline-27b-it-L43/concepts.pt", weights_only=True)
+    save_concept_vectors(concept_vec_dict, save_dir=Path(f"concept_vectors/concept-27b-it-L{LAYER}"), metadata=metadata)
 
-    # baseline_mean = torch.stack(list(baseline.values()), dim=0).mean(dim=0)
-    # print(baseline_mean)
+    # %%
+    concept = torch.load(f"concept_vectors/concept-27b-it-L{LAYER}/concepts.pt", weights_only=True)
+    baseline = torch.load(f"concept_vectors/baseline-27b-it-L{LAYER}/concepts.pt", weights_only=True)
 
-    # concept_diff = {
-    #     k: v - baseline_mean
-    #     for k, v in concept.items()
-    # }
-    # save_concept_vectors(concept_diff, save_dir=Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}"))
+    baseline_mean = torch.stack(list(baseline.values()), dim=0).mean(dim=0)
+    print(baseline_mean)
 
-    # # %%
-    # # Logit Lens of concept vectors
+    concept_diff = {
+        k: v - baseline_mean
+        for k, v in concept.items()
+    }
+    save_concept_vectors(concept_diff, save_dir=Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}"))
 
-    # concept_vectors = torch.load(f"concept_vectors/concept_diff-27b-it-L{LAYER}/concepts.pt", weights_only=True)
-    # final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
-    # unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
+    # %%
+    # Logit Lens of concept vectors
 
-    # output_lines = []
-    # for concept_word, concept_vec in concept_vectors.items():
-    #     concept_vec = final_norm(concept_vec)
-    #     logits = unembed @ concept_vec.to(unembed.device)
+    concept_vectors = torch.load(f"concept_vectors/concept_diff-27b-it-L{LAYER}/concepts.pt", weights_only=True)
+    final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
+    unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
 
-    #     # Get top tokens
-    #     top_values, top_indices = torch.topk(logits, k=20)
-    #     results = []
-    #     for idx, value in zip(top_indices, top_values):
-    #         token = tokenizer.decode([idx])
-    #         results.append((token, value.item()))
+    output_lines = []
+    for concept_word, concept_vec in concept_vectors.items():
+        concept_vec = final_norm(concept_vec)
+        logits = unembed @ concept_vec.to(unembed.device)
 
-    #     # Build results for file
-    #     output_lines.append(f"\n{concept_word}:")
-    #     for i, (token, value) in enumerate(results):
-    #         output_lines.append(f"  {i+1:2d}. {repr(token):20s} (logit: {value:.2f})")
+        # Get top tokens
+        top_values, top_indices = torch.topk(logits, k=20)
+        results = []
+        for idx, value in zip(top_indices, top_values):
+            token = tokenizer.decode([idx])
+            results.append((token, value.item()))
 
-    # # Save to text file
-    # output_path = f"concept_vectors/concept_diff-27b-it-L{LAYER}/logit_lens.txt"
-    # with open(output_path, "w", encoding="utf-8") as f:
-    #     f.write("\n".join(output_lines))
-    # print(f"Logit lens results saved to: {output_path}")
+        # Build results for file
+        output_lines.append(f"\n{concept_word}:")
+        for i, (token, value) in enumerate(results):
+            output_lines.append(f"  {i+1:2d}. {repr(token):20s} (logit: {value:.2f})")
+
+    # Save to text file
+    output_path = f"concept_vectors/concept_diff-27b-it-L{LAYER}/logit_lens.txt"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(output_lines))
+    print(f"Logit lens results saved to: {output_path}")
 
     # %%
     # Steering with concept vectors
     from tqdm.auto import tqdm
     from utils_model import generate_steer, SteerConfig
 
-    concept_vectors = torch.load("concept_vectors/concept_diff-27b-it-L43/concepts.pt", weights_only=True)
+    concept_vectors = torch.load(f"concept_vectors/concept_diff-27b-it-L{LAYER}/concepts.pt", weights_only=True)
 
     double_newline_pos = None
     inputs = introspection_inputs(tokenizer=tokenizer, prefill=False)
@@ -360,7 +390,7 @@ if __name__ == "__main__":
 
     # %%
     batch_size = 128
-    num_trials = 128
+    num_trials = 64
     strengths = [1.0, 2.0, 3.0, 4.0, 6.0]
 
     all_results = batched_steer_sweep(
@@ -371,7 +401,7 @@ if __name__ == "__main__":
         inputs=inputs,
         model=model,
         tokenizer=tokenizer,
-        layer=43,
+        layer=LAYER,
         tokens=slice(double_newline_pos, None),
         batch_size=batch_size,
         max_new_tokens=100,
