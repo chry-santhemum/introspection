@@ -114,14 +114,14 @@ TokenSpec = Union[list[int], slice]
 class FwdHook:
     module_name: str
     pos: Literal["input", "output"]
-    op: Literal["record", "replace", "add"]
+    op: Literal["record", "replace", "add", "proj_ablate"]
     tokens: TokenSpec
     tensor: Optional[Tensor] = None  # will be broadcast to x[tokens]
     grad: Optional[Tensor] = None  # populated by backward hook when allow_grad=True.
                                    # note: this captures grads wrt the modified outputs.
 
     def __post_init__(self):
-        if self.op in ("add", "replace") and self.tensor is None:
+        if self.op != "record" and self.tensor is None:
             raise ValueError(f"tensor is required for '{self.op}' operation")
 
 
@@ -152,8 +152,12 @@ def _apply_hook_op(h: FwdHook, x: Tensor) -> Optional[Tensor]:
 
     if h.op == "add":
         new_tensor[:, idx, :] += vec
-    else:
+    elif h.op == "replace":
         new_tensor[:, idx, :] = vec
+    elif h.op == "proj_ablate":
+        v_hat = vec / vec.norm(dim=-1, keepdim=True)
+        proj_coef = (new_tensor[:, idx, :] * v_hat).sum(dim=-1, keepdim=True)  # [batch, num_tokens, 1]
+        new_tensor[:, idx, :] -= proj_coef * vec
 
     return new_tensor
 

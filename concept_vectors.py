@@ -111,7 +111,7 @@ HUMAN_PROMPT_1 = '''I am an interpretability researcher studying transformer-bas
 HUMAN_PROMPT_2 = '''Ok, let's get started.\n\nTrial 1: Do you detect an injected thought? If so, what is the injected thought about?'''
 ASSISTANT_PREFILL = '''Yes, there is an injected thought. The injected thought is about the word "'''
 
-def introspection_inputs(tokenizer, append:Optional[str]=None, prefill:Optional[str]=None):
+def introspection_inputs(tokenizer, append: Optional[str]=None, prefill: Optional[str]=None, batch_size: int=1):
     messages = [
         {"role": "user", "content": HUMAN_PROMPT_1},
         {"role": "assistant", "content": "Ok."},
@@ -128,6 +128,8 @@ def introspection_inputs(tokenizer, append:Optional[str]=None, prefill:Optional[
         chat_formatted = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+    if batch_size > 1:
+        chat_formatted = [chat_formatted] * batch_size
 
     inputs = tokenizer(chat_formatted, return_tensors="pt", add_special_tokens=False)
     return inputs
