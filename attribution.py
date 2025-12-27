@@ -24,6 +24,7 @@ from utils_model import (
     SteerConfig,
     scale_vec,
     Activations,
+    fwd_steer,
     fwd_record_all,
 )
 from concept_vectors import introspection_inputs
@@ -178,14 +179,14 @@ def gradient_attribution(
         # Get final hidden state (last layer, last position)
         final_hidden = outputs.hidden_states[-1][0, -1, :]  # [hidden_dim]
 
-        # # Print top 10 most probable tokens
-        # logits = outputs.logits[0, -1, :]  # [vocab]
-        # probs = torch.softmax(logits.float(), dim=-1)
-        # top_probs, top_indices = torch.topk(probs, k=10)
-        # print("Top 10 tokens:")
-        # for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-        #     token = tokenizer.decode([idx])
-        #     print(f"  {i+1}. {repr(token):15s} prob={prob.item():.6f}")
+        # Print top 10 most probable tokens
+        logits = outputs.logits[0, -1, :]  # [vocab]
+        probs = torch.softmax(logits.float(), dim=-1)
+        top_probs, top_indices = torch.topk(probs, k=10)
+        print("Top 10 tokens:")
+        for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+            token = tokenizer.decode([idx])
+            print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
 
         # Compute metric and backward
         metric_value = metric(final_hidden)
@@ -288,6 +289,7 @@ def save_attribution_plots(
     components: list[ComponentType] = ["resid", "attn", "mlp"],
     cell_size: float = 0.15,
     start_layer: int = 0,
+    title: str|None = None
 ):
     """Save separate attribution heatmaps for each component.
 
@@ -302,9 +304,12 @@ def save_attribution_plots(
     import os
     os.makedirs(save_dir, exist_ok=True)
 
+    if title is None:
+        title = f'Attribution (metric: {result.metric_value:.2f})'
+
     for comp in components:
         attr = getattr(result, comp)
-        title = f'{COMPONENT_NAMES[comp]} Attribution (metric: {result.metric_value:.2f})'
+        title = f'{COMPONENT_NAMES[comp]} ' + title
         fig, _ = plot_attribution_heatmap(attr, result.tokens, title=title, cell_size=cell_size, start_layer=start_layer)
 
         filename = f"{prefix}_{comp}.png" if prefix else f"{comp}.png"
@@ -365,6 +370,7 @@ def save_layer_attribution_plot(
     components: list[ComponentType] = ["resid", "attn", "mlp"],
     agg_method: Literal["sum", "mean", "abs_sum", "abs_mean"] = "sum",
     start_layer: int = 0,
+    title: str|None = None
 ):
     """Save layer attribution plot.
 
@@ -379,7 +385,7 @@ def save_layer_attribution_plot(
     import os
     os.makedirs(save_dir, exist_ok=True)
 
-    fig, _ = plot_layer_attribution(result, components=components, agg_method=agg_method, start_layer=start_layer)
+    fig, _ = plot_layer_attribution(result, components=components, agg_method=agg_method, start_layer=start_layer, title=title)
 
     filename = f"{prefix}_layer_attribution.png" if prefix else "layer_attribution.png"
     filepath = os.path.join(save_dir, filename)
@@ -426,33 +432,31 @@ if __name__ == "__main__":
     # Load concept vectors
     LAYER = 38
     from concept_vectors import SUCCESS_WORDS
-    print(SUCCESS_WORDS)
 
     base_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}")
     concept_vectors = torch.load(base_path / "concepts.pt", weights_only=True)
 
     inputs = introspection_inputs(
         tokenizer, 
-        append=" Just directly say the word representing the injected thought.", 
+        append=None,
         prefill=None
-    )
+    ).to("cuda:0")
 
     # Find double newline position for steering
     decoded_tokens = [tokenizer.decode(x) for x in inputs["input_ids"][0]]
-
     for i, tok in enumerate(decoded_tokens):
         if tok == "\n\n":
             double_newline_pos = i
             break
 
-    yes_token_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
-    no_token_id = tokenizer.encode("No", add_special_tokens=False)[0]
-    print(f"Token IDs for 'Yes': {yes_token_id}, 'No': {no_token_id}")
-
     # %%
-    for word in SUCCESS_WORDS[:3]:
+    # Harmonies and Sugar are relatively weak
+    AFFIRM_WORDS = ["Algorithms", "Aquariums", "Bread", "Origami", "Satellites", "Trees", "Vegetables", "Volcanoes"]
+    
+    for word in SUCCESS_WORDS:
+        print(f"{word}:")
         word_token_id = tokenizer.encode(word, add_special_tokens=False)[0]
-        print(f"Token ID for '{word}': {word_token_id}")
+        no_token_id = tokenizer.encode("No", add_special_tokens=False)[0]
 
         steer_config = SteerConfig(
             layer=LAYER,
@@ -461,37 +465,50 @@ if __name__ == "__main__":
             strength=4.0,
         )
 
+        steered_logits = fwd_steer(
+            steer_config=steer_config,
+            model=model,
+            inputs=inputs
+        )
+
+        logits = steered_logits[0]
+        top_token_id = int(torch.argmax(logits).item())
+        print(f"Top token ID: {top_token_id}")
+        top_token = tokenizer.decode([top_token_id])
+        print(f"Top token: {top_token}")
+
+        # probs = torch.softmax(logits.float(), dim=-1)
+        # top_probs, top_indices = torch.topk(probs, k=10)
+        # print("Top 10 tokens:")
+        # for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+        #     token = tokenizer.decode([idx])
+        #     print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
+
+
         source_acts = fwd_record_all(
             model=model,
             inputs=inputs,
-            steer_config=steer_config,
+            steer_config=None,
             components=["resid", "attn", "mlp"],
         )
 
-        # Print top 10 most probable tokens
-        last_layer_acts = getattr(source_acts, "resid")[-1, -1, :]  # [hidden]
-        final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
-        unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
-        logits = unembed @ final_norm(last_layer_acts.to(unembed.device))
-
-        probs = torch.softmax(logits.float(), dim=-1)
-        top_probs, top_indices = torch.topk(probs, k=10)
-        print("Top 10 tokens:")
-        for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-            token = tokenizer.decode([idx])
-            print(f"  {i+1}. {repr(token):15s} prob={prob.item():.6f}")
+        # # Print top 10 most probable tokens
+        # last_layer_acts = getattr(source_acts, "resid")[-1, -1, :]  # [hidden]
+        # final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
+        # unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
+        # logits = unembed @ final_norm(last_layer_acts.to(unembed.device))
 
         result = gradient_attribution(
             model=model,
             tokenizer=tokenizer,
             inputs=inputs,
-            steer_config=None,
-            metric=logit_metric(model, word_token_id),
+            steer_config=steer_config,
+            metric=logit_diff_metric(model, top_token_id, no_token_id),
             baseline=source_acts,
             attr_start_pos=double_newline_pos,
         )
 
-        save_attribution_plots(result, save_dir="attribution/steer_to_ctrl", prefix=word, start_layer=LAYER)
-        save_layer_attribution_plot(result, save_dir="attribution/steer_to_ctrl", prefix=word, start_layer=LAYER)
+        save_attribution_plots(result, save_dir="attribution/ctrl_to_steer", prefix=word, start_layer=LAYER, title=f"Attribution (metric: logit({top_token}) - logit(No)) = {result.metric_value:.2f}")
+        save_layer_attribution_plot(result, save_dir="attribution/ctrl_to_steer", prefix=word, start_layer=LAYER, title=f"Layer Attribution (metric: logit({top_token}) - logit(No)) = {result.metric_value:.2f}")
 
 # %%
