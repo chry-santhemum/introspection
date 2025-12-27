@@ -26,7 +26,7 @@ from utils_model import (
     Activations,
     fwd_record_all,
 )
-from concept_vectors import introspection_inputs, ASSISTANT_PREFILL
+from concept_vectors import introspection_inputs
 
 
 # --- Attribution computation ---
@@ -433,7 +433,7 @@ if __name__ == "__main__":
 
     inputs = introspection_inputs(
         tokenizer, 
-        append=" Answer first with either Yes or No, then answer the question." + " ."*32, 
+        append=" Just directly say the word representing the injected thought.", 
         prefill=None
     )
 
@@ -450,7 +450,10 @@ if __name__ == "__main__":
     print(f"Token IDs for 'Yes': {yes_token_id}, 'No': {no_token_id}")
 
     # %%
-    for word in SUCCESS_WORDS:
+    for word in SUCCESS_WORDS[:3]:
+        word_token_id = tokenizer.encode(word, add_special_tokens=False)[0]
+        print(f"Token ID for '{word}': {word_token_id}")
+
         steer_config = SteerConfig(
             layer=LAYER,
             tokens=slice(double_newline_pos, None),
@@ -483,7 +486,7 @@ if __name__ == "__main__":
             tokenizer=tokenizer,
             inputs=inputs,
             steer_config=None,
-            metric=logit_diff_metric(model, yes_token_id, no_token_id),
+            metric=logit_metric(model, word_token_id),
             baseline=source_acts,
             attr_start_pos=double_newline_pos,
         )
