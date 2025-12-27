@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 from jaxtyping import Float
 from pathlib import Path
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 
 import torch
 from torch import Tensor
@@ -27,118 +27,6 @@ from utils_model import (
     fwd_record_all,
 )
 from concept_vectors import introspection_inputs, ASSISTANT_PREFILL
-
-
-def compute_mean_activations(
-    model,
-    tokenizer,
-    dataset: Dataset,
-    num_tokens: int = 100_000,
-    seq_len: int = 1024,
-    text_column: str = "text",
-    components: list[ComponentType] = ["resid", "attn", "mlp"],
-) -> Activations:
-    """Compute mean activations across dataset, returned as Activations with seq_len=1."""
-    device = next(model.parameters()).device
-    num_layers = get_num_layers(model)
-    module_names = get_all_component_names(model, components)
-
-    # Create record hooks for all components
-    record_hooks = {
-        key: FwdHook(
-            module_name=module_name,
-            pos="output",
-            op="record",
-            tokens=slice(None),
-        )
-        for key, module_name in module_names.items()
-    }
-
-    # Running sum and count for online mean computation
-    running_sum = {key: None for key in module_names.keys()}
-    total_tokens = 0
-
-    def process_chunk(inputs):
-        """Process a single chunk and accumulate activations."""
-        nonlocal total_tokens
-
-        chunk_len = inputs["input_ids"].shape[1]
-        if chunk_len == 0:
-            return
-
-        # Reset hook tensors
-        for hook in record_hooks.values():
-            hook.tensor = None
-
-        # Forward pass
-        with fwd_with_hooks(list(record_hooks.values()), model, allow_grad=False):
-            model(**inputs)
-
-        # Accumulate activations (online mean computation)
-        for key, hook in record_hooks.items():
-            act = hook.tensor  # [1, seq_len, hidden]
-            act_sum = act[0].sum(dim=0).detach().cpu()  # [hidden]
-
-            if running_sum[key] is None:
-                running_sum[key] = act_sum
-            else:
-                running_sum[key] += act_sum
-
-        total_tokens += chunk_len
-
-    # Process text, accumulating into buffer to fill seq_len chunks
-    text_buffer = ""
-    text_idx = 0
-
-    while total_tokens < num_tokens and text_idx < len(dataset):
-        # Accumulate text until we have enough for a chunk
-        while len(tokenizer.encode(text_buffer)) < seq_len and text_idx < len(dataset):
-            text = dataset[text_idx][text_column]
-            if text and text.strip():
-                text_buffer += text + " "
-            text_idx += 1
-
-        if len(tokenizer.encode(text_buffer)) < seq_len:
-            break
-
-        # Tokenize a chunk
-        inputs = tokenizer(
-            text_buffer,
-            return_tensors="pt",
-            max_length=seq_len,
-            truncation=True,
-            add_special_tokens=False,
-        ).to(device)
-
-        # Remove processed tokens from buffer
-        processed_text = tokenizer.decode(inputs["input_ids"][0])
-        text_buffer = text_buffer[len(processed_text):].lstrip()
-
-        process_chunk(inputs)
-
-        if total_tokens % 2000 < seq_len:
-            print(f"Processed {total_tokens}/{num_tokens} tokens")
-
-    print(f"Finished processing {total_tokens} tokens")
-
-    # Compute final means
-    mean_acts = {comp: [] for comp in components}
-    for (comp, _layer), act_sum in sorted(running_sum.items(), key=lambda x: (x[0][0], x[0][1])):
-        mean = act_sum / total_tokens  # [hidden]
-        mean_acts[comp].append(mean)
-
-    # Stack layers and add seq_len=1 dim: [num_layers, 1, hidden]
-    result = {}
-    for comp in components:
-        stacked = torch.stack(mean_acts[comp], dim=0)  # [num_layers, hidden]
-        result[comp] = stacked.unsqueeze(1)  # [num_layers, 1, hidden]
-
-    hidden_dim = result[components[0]].shape[-1]
-    return Activations(
-        resid=result.get("resid", torch.zeros(num_layers, 1, hidden_dim)),
-        attn=result.get("attn", torch.zeros(num_layers, 1, hidden_dim)),
-        mlp=result.get("mlp", torch.zeros(num_layers, 1, hidden_dim)),
-    )
 
 
 # --- Attribution computation ---
@@ -211,13 +99,10 @@ class AttributionResult:
     tokens: list[str]
     metric_value: float
 
-    def get(self, component: ComponentType) -> Tensor:
-        return getattr(self, component)
-
     def aggregate(self, method: Literal["sum", "mean", "abs_sum", "abs_mean"] = "sum") -> dict[ComponentType, Tensor]:
         result = {}
         for comp in ["resid", "attn", "mlp"]:
-            attr = self.get(comp)  # [num_layers, seq_len]
+            attr = getattr(self, comp)  # [num_layers, seq_len]
             match method:
                 case "sum":
                     result[comp] = attr.sum(dim=1)
@@ -243,13 +128,6 @@ def gradient_attribution(
     """Gradient-based attribution for activation patching approximation.
 
     Computes: attribution = d(metric)/d(component_output) · (activation - baseline)
-
-    Args:
-        metric: Function that takes logits [vocab] and returns a scalar tensor.
-                Use logit_metric(token_id) for single token attribution.
-        baseline: Activations with shape [num_layers, seq_len, hidden].
-                  - seq_len=1: broadcasts to all positions (mean ablation)
-                  - seq_len=full: position-specific (patching from another run)
     """
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -425,7 +303,7 @@ def save_attribution_plots(
     os.makedirs(save_dir, exist_ok=True)
 
     for comp in components:
-        attr = result.get(comp)
+        attr = getattr(result, comp)
         title = f'{COMPONENT_NAMES[comp]} Attribution (metric: {result.metric_value:.2f})'
         fig, _ = plot_attribution_heatmap(attr, result.tokens, title=title, cell_size=cell_size, start_layer=start_layer)
 
@@ -588,7 +466,7 @@ if __name__ == "__main__":
         )
 
         # Print top 10 most probable tokens
-        last_layer_acts = source_acts.get("resid")[-1, -1, :]  # [hidden]
+        last_layer_acts = getattr(source_acts, "resid")[-1, -1, :]  # [hidden]
         final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
         unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
         logits = unembed @ final_norm(last_layer_acts.to(unembed.device))

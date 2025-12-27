@@ -2,19 +2,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Optional, Union
 from jaxtyping import Float, Int
+from datasets import Dataset
 
 import torch
 from torch import nn, Tensor
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 
-# --- Component types for attribution ---
-
-ComponentType = Literal["resid", "attn", "mlp"]
-
 
 def load_model(model_name: str, **kwargs):
-    """**kwargs: Passed to AutoModelForCausalLM.from_pretrained
+    """**kwargs are Passed to AutoModelForCausalLM.from_pretrained
     
     e.g. device, dtype, quantization_config"""
 
@@ -84,6 +81,9 @@ def get_layer_at_fraction(model, fraction: float) -> int:
     return max(0, min(layer_idx, num_layers - 1))
 
 
+
+ComponentType = Literal["resid", "attn", "mlp"]
+
 def get_all_component_names(model, components: list[ComponentType]) -> dict[tuple[ComponentType, int], str]:
     """Get module names for all components at all layers.
 
@@ -117,11 +117,45 @@ class FwdHook:
     op: Literal["record", "replace", "add"]
     tokens: TokenSpec
     tensor: Optional[Tensor] = None  # will be broadcast to x[tokens]
-    grad: Optional[Tensor] = None  # populated by backward hook when allow_grad=True
+    grad: Optional[Tensor] = None  # populated by backward hook when allow_grad=True.
+                                   # note: this captures grads wrt the modified outputs.
 
     def __post_init__(self):
         if self.op in ("add", "replace") and self.tensor is None:
             raise ValueError(f"tensor is required for '{self.op}' operation")
+
+
+def _apply_hook_op(h: FwdHook, x: Tensor) -> Optional[Tensor]:
+    """Apply hook operation to x.
+
+    Assumes KV cache is used when seq_len=1.
+    """
+    idx = h.tokens
+
+    # Handle KV cache decode step (seq_len=1)
+    # Generated tokens should be steered if h.tokens is unbounded
+    if x.shape[1] == 1:
+        if isinstance(idx, slice) and idx.stop is None:
+            idx = slice(None)  # steer the single generated token
+        else:
+            return None
+
+    if h.op == "record":
+        if h.tensor is None:
+            h.tensor = x[:, idx, :].clone()
+        else:
+            h.tensor.copy_(x[:, idx, :])
+        return None
+
+    new_tensor = x.clone()
+    vec = h.tensor.to(device=x.device, dtype=x.dtype)
+
+    if h.op == "add":
+        new_tensor[:, idx, :] += vec
+    else:
+        new_tensor[:, idx, :] = vec
+
+    return new_tensor
 
 
 def _get_tensor(x):
@@ -132,69 +166,25 @@ def _set_tensor(original, new_tensor):
         return (new_tensor,) + original[1:]
     return new_tensor
 
-def _apply_hook_op(h: FwdHook, tensor: Tensor, retain_grad: bool = False) -> Optional[Tensor]:
-    """Apply hook operation. Returns new tensor for add/replace, None for record.
-
-    Handles forward passes using KV cache (seq_len=1).
-
-    Args:
-        retain_grad: If True and op is "record", call retain_grad() on the
-                     recorded tensor for gradient computation.
-    """
-    seq_len = tensor.shape[1]
-    idx = h.tokens
-
-    # Handle KV cache decode step (seq_len=1)
-    # Generated tokens should be steered if spec is unbounded (open-ended slice)
-    if seq_len == 1:
-        if isinstance(idx, slice) and idx.stop is None:
-            idx = slice(None)  # steer the single generated token
-        elif isinstance(idx, list):
-            return None  # explicit positions don't include generated tokens
-        else:  # Bounded slice, don't steer generated tokens
-            return None
-
-    if h.op == "record":
-        if h.tensor is None:
-            h.tensor = tensor[:, idx, :].clone()
-        else:
-            h.tensor.copy_(tensor[:, idx, :])
-        if retain_grad:
-            h.tensor.retain_grad()
-        return None
-
-    new_tensor = tensor.clone()
-    vec = h.tensor.to(device=tensor.device, dtype=tensor.dtype)
-
-    if h.op == "add":
-        new_tensor[:, idx, :] += vec
-    else:
-        new_tensor[:, idx, :] = vec
-
-    return new_tensor
-
-
-def make_hook(h: FwdHook, retain_grad: bool = False):
+def make_fwd_hook(h: FwdHook):
     if h.pos == "output":
-        def hook_fn(module, input, output):
-            result = _apply_hook_op(h, _get_tensor(output), retain_grad=retain_grad)
+        def output_hook(module, input, output):
+            result = _apply_hook_op(h, _get_tensor(output))
             return _set_tensor(output, result) if result is not None else None
-        return hook_fn
+        return output_hook
     else:
-        def hook_fn(module, input):
-            result = _apply_hook_op(h, _get_tensor(input), retain_grad=retain_grad)
+        def input_hook(module, input):
+            result = _apply_hook_op(h, _get_tensor(input))
             return _set_tensor(input, result) if result is not None else None
-        return hook_fn
+        return input_hook
 
 
-def make_backward_hook(h: FwdHook):
-    """Create backward hook to capture gradients for a FwdHook."""
+def make_bwd_hook(h: FwdHook):
+    """Capture output gradients for a FwdHook."""
     def hook_fn(module, grad_input, grad_output):
-        # grad_output is tuple, first element is the gradient w.r.t. output
         grad_tensor = grad_output[0]
         if grad_tensor is not None:
             idx = h.tokens
-            # Handle same slicing as forward hook
             h.grad = grad_tensor[:, idx, :].clone().detach()
         return None
     return hook_fn
@@ -203,13 +193,9 @@ def make_backward_hook(h: FwdHook):
 @contextmanager
 def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
     """Context manager for running forward pass with hooks.
-
-    Args:
-        hooks: List of hook configurations
-        model: The model to hook
-        allow_grad: If False (default), runs in inference_mode with no gradients.
-                    If True, gradients are enabled and backward hooks are
-                    registered to capture gradients for "record" ops.
+    
+    allow_grad: If False (default), runs in inference_mode with no gradients.
+                If True, gradients are enabled and backward hooks are registered.
     """
     handles = []
 
@@ -217,14 +203,14 @@ def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
     for hook in hooks:
         module = get_module(model, hook.module_name)
         if hook.pos == "output":
-            handle = module.register_forward_hook(make_hook(hook, retain_grad=allow_grad))
+            handle = module.register_forward_hook(make_fwd_hook(hook))
         else:
-            handle = module.register_forward_pre_hook(make_hook(hook, retain_grad=allow_grad))
+            handle = module.register_forward_pre_hook(make_fwd_hook(hook))
         handles.append(handle)
 
-        # Register backward hooks to capture gradients for record ops
-        if allow_grad and hook.op == "record":
-            bwd_handle = module.register_full_backward_hook(make_backward_hook(hook))
+        # Register backward hooks to capture gradients
+        if allow_grad:
+            bwd_handle = module.register_full_backward_hook(make_bwd_hook(hook))
             handles.append(bwd_handle)
 
     if allow_grad:
@@ -237,7 +223,7 @@ def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
         handle.remove()
 
 
-# --- Recording resid activations wrapper ---
+# --- Recording activations wrapper ---
 
 def fwd_record_resid(
     model,
@@ -248,8 +234,8 @@ def fwd_record_resid(
     """Record residual stream activations at a specific layer and position."""
     module_name = get_resid_block_name(model, layer)
 
-    # Use slice for single position to keep [batch, 1, hidden] then squeeze
-    tokens = [pos] if pos >= 0 else slice(pos, None)
+    # slice for a single position
+    tokens = slice(pos, pos + 1 if pos != -1 else None)
 
     record_hook = FwdHook(
         module_name=module_name,
@@ -257,13 +243,103 @@ def fwd_record_resid(
         op="record",
         tokens=tokens,
     )
-
+    
+    # no grad
     with fwd_with_hooks([record_hook], model):
         model(**inputs)
 
     # record_hook.tensor is [batch, 1, hidden], squeeze to [batch, hidden]
     return record_hook.tensor.squeeze(1)
 
+
+# --- Steering wrapper ---
+
+@dataclass(kw_only=True)
+class SteerConfig:
+    layer: int
+    tokens: TokenSpec
+    vec: Tensor  # will be broadcast to x[tokens]
+    strength: Tensor|float = 1.0  # scalar or [batch]
+
+
+def scale_vec(vec: Tensor, strength: Tensor|float) -> Tensor:
+    """Scale steering vector by strength, then unsqueeze to broadcast to BSH"""
+
+    if isinstance(strength, (int, float)):
+        scaled = vec * strength
+    else:
+        # strength [batch] → [batch, 1] for broadcasting
+        scaled = vec * strength.unsqueeze(-1)
+
+    # If result has batch dim, need [batch, 1, hidden] for [batch, seq, hidden] broadcast
+    if scaled.dim() == 2:
+        scaled = scaled.unsqueeze(1)
+
+    return scaled
+
+
+# Simple forward pass with steering vector applied
+
+def fwd_steer(
+    steer_config: SteerConfig,
+    model,
+    inputs: dict[str, Tensor],
+    other_hooks: Optional[list[FwdHook]] = None,
+) -> Float[Tensor, "batch vocab"]:
+    module_name = get_resid_block_name(model, steer_config.layer)
+
+    steer_hook = FwdHook(
+        module_name=module_name,
+        pos="output",
+        op="add",
+        tokens=steer_config.tokens,
+        tensor=scale_vec(steer_config.vec, steer_config.strength),
+    )
+
+    # Hooks on the same module will be applied in the order they were registered
+    # We register the steer hook first
+    all_hooks = [steer_hook]
+    if other_hooks:
+        all_hooks.extend(other_hooks)
+
+    with fwd_with_hooks(all_hooks, model):
+        outputs = model(**inputs)
+
+    return outputs.logits[:, -1, :]
+
+
+def generate_steer(
+    steer_config: SteerConfig,
+    model,
+    inputs: dict[str, Tensor],
+    other_hooks: list[FwdHook] = None,
+    **generate_kwargs,
+) -> Int[Tensor, "batch out_seq"]:
+    """**generate_kwargs: Passed to model.generate()
+    
+    e.g. max_new_tokens, temperature, do_sample, etc."""
+    module_name = get_resid_block_name(model, steer_config.layer)
+
+    steer_hook = FwdHook(
+        module_name=module_name,
+        pos="output",
+        op="add",
+        tokens=steer_config.tokens,
+        tensor=scale_vec(steer_config.vec, steer_config.strength),
+    )
+
+    all_hooks = [steer_hook]
+    if other_hooks:
+        all_hooks.extend(other_hooks)
+
+    with fwd_with_hooks(all_hooks, model):
+        output_ids = model.generate(**inputs, use_cache=True, **generate_kwargs)
+
+    return output_ids
+
+
+
+# --- Activations ---
 
 @dataclass
 class Activations:
@@ -276,12 +352,9 @@ class Activations:
     attn: Float[Tensor, "num_layers seq_len hidden"]
     mlp: Float[Tensor, "num_layers seq_len hidden"]
 
-    def get(self, component: ComponentType) -> Tensor:
-        return getattr(self, component)
-
-    def get_at(self, component: ComponentType, layer: int, pos: int) -> Tensor:
+    def get_at(self, comp: ComponentType, layer: int, pos: int) -> Float[Tensor, "hidden"]:
         """Get activation at (layer, pos), broadcasting if seq_len=1."""
-        tensor = self.get(component)
+        tensor = getattr(self, comp)
         actual_pos = 0 if tensor.shape[1] == 1 else pos
         return tensor[layer, actual_pos, :]
 
@@ -291,10 +364,6 @@ class Activations:
             f"attn={list(self.attn.shape)}, "
             f"mlp={list(self.mlp.shape)})"
         )
-
-
-# Backwards compatibility alias
-ForwardResult = Activations
 
 
 def fwd_record_all(
@@ -312,7 +381,7 @@ def fwd_record_all(
         components: Which components to record
 
     Returns:
-        ForwardResult with activations [num_layers, seq_len, hidden] per component
+        Activations with activations [num_layers, seq_len, hidden] per component
     """
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -368,87 +437,113 @@ def fwd_record_all(
     )
 
 
-# --- Steering wrapper ---
-
-@dataclass(kw_only=True)
-class SteerConfig:
-    layer: int
-    tokens: TokenSpec
-    vec: Tensor  # [hidden], will be broadcast to x[tokens]
-    strength: float | Tensor = 1.0  # scalar or [batch]
-
-
-def scale_vec(vec: Tensor, strength: float | Tensor) -> Tensor:
-    """Scale steering vector by strength.
-
-    Args:
-        vec: [hidden] or [batch, hidden]
-        strength: scalar or [batch]
-
-    Returns:
-        Scaled vector that broadcasts with [batch, seq, hidden]
-    """
-    if isinstance(strength, (int, float)):
-        scaled = vec * strength
-    else:
-        # strength [batch] → [batch, 1] for broadcasting
-        scaled = vec * strength.unsqueeze(-1)
-
-    # If result has batch dim, need [batch, 1, hidden] for [batch, seq, hidden] broadcast
-    if scaled.dim() == 2:
-        scaled = scaled.unsqueeze(1)
-
-    return scaled
-
-
-def fwd_steer(
-    steer_config: SteerConfig,
+def compute_mean_activations(
     model,
-    inputs: dict[str, Tensor],
-    other_hooks: Optional[list[FwdHook]] = None,
-) -> Float[Tensor, "batch vocab"]:
-    module_name = get_resid_block_name(model, steer_config.layer)
+    tokenizer,
+    dataset: Dataset,
+    num_tokens: int = 100_000,
+    seq_len: int = 1024,
+    text_column: str = "text",
+    components: list[ComponentType] = ["resid", "attn", "mlp"],
+) -> Activations:
+    """Compute mean activations across dataset, returned as Activations with seq_len=1."""
+    device = next(model.parameters()).device
+    num_layers = get_num_layers(model)
+    module_names = get_all_component_names(model, components)
 
-    steer_hook = FwdHook(
-        module_name=module_name,
-        pos="output",
-        op="add",
-        tokens=steer_config.tokens,
-        tensor=scale_vec(steer_config.vec, steer_config.strength),
+    # Create record hooks for all components
+    record_hooks = {
+        key: FwdHook(
+            module_name=module_name,
+            pos="output",
+            op="record",
+            tokens=slice(None),
+        )
+        for key, module_name in module_names.items()
+    }
+
+    # Running sum and count for online mean computation
+    running_sum = {key: None for key in module_names.keys()}
+    total_tokens = 0
+
+    def process_chunk(inputs):
+        """Process a single chunk and accumulate activations."""
+        nonlocal total_tokens
+
+        chunk_len = inputs["input_ids"].shape[1]
+        if chunk_len == 0:
+            return
+
+        # Reset hook tensors
+        for hook in record_hooks.values():
+            hook.tensor = None
+
+        # Forward pass
+        with fwd_with_hooks(list(record_hooks.values()), model, allow_grad=False):
+            model(**inputs)
+
+        # Accumulate activations (online mean computation)
+        for key, hook in record_hooks.items():
+            act = hook.tensor  # [1, seq_len, hidden]
+            act_sum = act[0].sum(dim=0).detach().cpu()  # [hidden]
+
+            if running_sum[key] is None:
+                running_sum[key] = act_sum
+            else:
+                running_sum[key] += act_sum
+
+        total_tokens += chunk_len
+
+    # Process text, accumulating into buffer to fill seq_len chunks
+    text_buffer = ""
+    text_idx = 0
+
+    while total_tokens < num_tokens and text_idx < len(dataset):
+        # Accumulate text until we have enough for a chunk
+        while len(tokenizer.encode(text_buffer)) < seq_len and text_idx < len(dataset):
+            text = dataset[text_idx][text_column]
+            if text and text.strip():
+                text_buffer += text + " "
+            text_idx += 1
+
+        if len(tokenizer.encode(text_buffer)) < seq_len:
+            break
+
+        # Tokenize a chunk
+        inputs = tokenizer(
+            text_buffer,
+            return_tensors="pt",
+            max_length=seq_len,
+            truncation=True,
+            add_special_tokens=False,
+        ).to(device)
+
+        # Remove processed tokens from buffer
+        processed_text = tokenizer.decode(inputs["input_ids"][0])
+        text_buffer = text_buffer[len(processed_text):].lstrip()
+
+        process_chunk(inputs)
+
+        if total_tokens % 2000 < seq_len:
+            print(f"Processed {total_tokens}/{num_tokens} tokens")
+
+    print(f"Finished processing {total_tokens} tokens")
+
+    # Compute final means
+    mean_acts = {comp: [] for comp in components}
+    for (comp, _layer), act_sum in sorted(running_sum.items(), key=lambda x: (x[0][0], x[0][1])):
+        mean = act_sum / total_tokens  # [hidden]
+        mean_acts[comp].append(mean)
+
+    # Stack layers and add seq_len=1 dim: [num_layers, 1, hidden]
+    result = {}
+    for comp in components:
+        stacked = torch.stack(mean_acts[comp], dim=0)  # [num_layers, hidden]
+        result[comp] = stacked.unsqueeze(1)  # [num_layers, 1, hidden]
+
+    hidden_dim = result[components[0]].shape[-1]
+    return Activations(
+        resid=result.get("resid", torch.zeros(num_layers, 1, hidden_dim)),
+        attn=result.get("attn", torch.zeros(num_layers, 1, hidden_dim)),
+        mlp=result.get("mlp", torch.zeros(num_layers, 1, hidden_dim)),
     )
-
-    all_hooks = [steer_hook]
-    if other_hooks:
-        all_hooks.extend(other_hooks)
-
-    with fwd_with_hooks(all_hooks, model):
-        outputs = model(**inputs)
-
-    return outputs.logits[:, -1, :]
-
-def generate_steer(
-    steer_config: SteerConfig,
-    model,
-    inputs: dict[str, Tensor],
-    other_hooks: list[FwdHook] = None,
-    **generate_kwargs,
-) -> Int[Tensor, "batch out_seq"]:
-    """**generate_kwargs: Passed to model.generate() (max_new_tokens, temperature, do_sample, etc.)"""
-    module_name = get_resid_block_name(model, steer_config.layer)
-
-    steer_hook = FwdHook(
-        module_name=module_name,
-        pos="output",
-        op="add",
-        tokens=steer_config.tokens,
-        tensor=scale_vec(steer_config.vec, steer_config.strength),
-    )
-
-    all_hooks = [steer_hook]
-    if other_hooks:
-        all_hooks.extend(other_hooks)
-
-    with fwd_with_hooks(all_hooks, model):
-        output_ids = model.generate(**inputs, use_cache=True, **generate_kwargs)
-
-    return output_ids
