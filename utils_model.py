@@ -9,6 +9,7 @@ from torch import nn, Tensor
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 
+# --- Model loading ---
 
 def load_model(model_name: str, **kwargs):
     """**kwargs are Passed to AutoModelForCausalLM.from_pretrained
@@ -227,6 +228,7 @@ def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
         handle.remove()
 
 
+
 # --- Recording activations wrapper ---
 
 def fwd_record_resid(
@@ -247,16 +249,15 @@ def fwd_record_resid(
         op="record",
         tokens=tokens,
     )
-    
-    # no grad
-    with fwd_with_hooks([record_hook], model):
+
+    with fwd_with_hooks([record_hook], model, allow_grad=False):
         model(**inputs)
 
     # record_hook.tensor is [batch, 1, hidden], squeeze to [batch, hidden]
     return record_hook.tensor.squeeze(1)
 
 
-# --- Steering wrapper ---
+# --- Steering hooks ---
 
 @dataclass(kw_only=True)
 class SteerConfig:
@@ -281,69 +282,17 @@ def scale_vec(vec: Tensor, strength: Tensor|float) -> Tensor:
 
     return scaled
 
-
-# Simple forward pass with steering vector applied
-
-def fwd_steer(
-    steer_config: SteerConfig,
-    model,
-    inputs: dict[str, Tensor],
-    other_hooks: Optional[list[FwdHook]] = None,
-) -> Float[Tensor, "batch vocab"]:
-    module_name = get_resid_block_name(model, steer_config.layer)
-
-    steer_hook = FwdHook(
-        module_name=module_name,
+def make_steer_hook(sc: SteerConfig, model) -> FwdHook:
+    return FwdHook(
+        module_name=get_resid_block_name(model, sc.layer),
         pos="output",
         op="add",
-        tokens=steer_config.tokens,
-        tensor=scale_vec(steer_config.vec, steer_config.strength),
+        tokens=sc.tokens,
+        tensor=scale_vec(sc.vec, sc.strength),
     )
 
-    # Hooks on the same module will be applied in the order they were registered
-    # We register the steer hook first
-    all_hooks = [steer_hook]
-    if other_hooks:
-        all_hooks.extend(other_hooks)
 
-    with fwd_with_hooks(all_hooks, model):
-        outputs = model(**inputs)
-
-    return outputs.logits[:, -1, :]
-
-
-def generate_steer(
-    steer_config: SteerConfig,
-    model,
-    inputs: dict[str, Tensor],
-    other_hooks: list[FwdHook] = None,
-    **generate_kwargs,
-) -> Int[Tensor, "batch out_seq"]:
-    """**generate_kwargs: Passed to model.generate()
-    
-    e.g. max_new_tokens, temperature, do_sample, etc."""
-    module_name = get_resid_block_name(model, steer_config.layer)
-
-    steer_hook = FwdHook(
-        module_name=module_name,
-        pos="output",
-        op="add",
-        tokens=steer_config.tokens,
-        tensor=scale_vec(steer_config.vec, steer_config.strength),
-    )
-
-    all_hooks = [steer_hook]
-    if other_hooks:
-        all_hooks.extend(other_hooks)
-
-    with fwd_with_hooks(all_hooks, model):
-        output_ids = model.generate(**inputs, use_cache=True, **generate_kwargs)
-
-    return output_ids
-
-
-
-# --- Activations ---
+# --- Patching hooks ---
 
 @dataclass
 class Activations:
@@ -369,24 +318,53 @@ class Activations:
             f"mlp={list(self.mlp.shape)})"
         )
 
+@dataclass
+class PatchConfig:
+    source: Activations
+    patches: dict[tuple[ComponentType, int], TokenSpec]  # (comp, layer) -> tokens
+
+    @classmethod
+    def from_modules(
+        cls,
+        source: Activations,
+        modules: list[tuple[ComponentType, int]],
+        tokens: TokenSpec,
+    ) -> "PatchConfig":
+        """Create PatchConfig with same tokens for all modules."""
+        return cls(source=source, patches={m: tokens for m in modules})
+
+
+def make_patch_hook(patch_config: PatchConfig, model) -> list[FwdHook]:
+    """Create FwdHooks for patching from source activations."""
+    hooks = []
+    component_names = get_all_component_names(model, ["resid", "attn", "mlp"])
+
+    for (comp, layer), tokens in patch_config.patches.items():
+        module_name = component_names[(comp, layer)]
+        # Get source activation at the positions we're patching: [num_tokens, hidden] -> [1, num_tokens, hidden]
+        source_layer = getattr(patch_config.source, comp)[layer]  # [seq_len, hidden]
+        source_tensor = source_layer[tokens].unsqueeze(0)  # [1, num_tokens, hidden]
+
+        hooks.append(FwdHook(
+            module_name=module_name,
+            pos="output",
+            op="replace",
+            tokens=tokens,
+            tensor=source_tensor,
+        ))
+
+    return hooks
+
+
+# --- Activation recording ---
 
 def fwd_record_all(
     model,
     inputs: dict[str, Tensor],
-    steer_config: Optional["SteerConfig"] = None,
+    hooks: list[FwdHook],
     components: list[ComponentType] = ["resid", "attn", "mlp"],
 ) -> Activations:
-    """Forward pass recording activations at all layers for specified components.
-
-    Args:
-        model: The model to run
-        inputs: Tokenized inputs dict
-        steer_config: Optional steering configuration
-        components: Which components to record
-
-    Returns:
-        Activations with activations [num_layers, seq_len, hidden] per component
-    """
+    """Forward pass recording activations at all layers for specified components."""
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -406,20 +384,10 @@ def fwd_record_all(
     }
 
     all_hooks = list(record_hooks.values())
-
-    # Add steering hook if configured
-    if steer_config:
-        steer_hook = FwdHook(
-            module_name=get_resid_block_name(model, steer_config.layer),
-            pos="output",
-            op="add",
-            tokens=steer_config.tokens,
-            tensor=scale_vec(steer_config.vec, steer_config.strength),
-        )
-        all_hooks.append(steer_hook)
+    all_hooks.extend(hooks)
 
     with fwd_with_hooks(all_hooks, model, allow_grad=False):
-        outputs = model(**inputs)
+        _ = model(**inputs)
 
     # Collect activations: [num_layers, seq_len, hidden]
     activations = {comp: [] for comp in components}

@@ -23,7 +23,6 @@ from utils_model import (
     SteerConfig,
     scale_vec,
     Activations,
-    fwd_steer,
     fwd_record_all,
     TokenSpec,
 )

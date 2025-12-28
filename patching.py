@@ -13,118 +13,12 @@ from utils_model import (
     ComponentType,
     FwdHook,
     SteerConfig,
-    TokenSpec,
     fwd_record_all,
     fwd_with_hooks,
-    fwd_steer,
-    get_all_component_names,
-    get_resid_block_name,
     load_model,
     load_tokenizer,
     scale_vec,
 )
-
-
-@dataclass
-class PatchConfig:
-    source: Activations
-    patches: dict[tuple[ComponentType, int], TokenSpec]  # (comp, layer) -> tokens
-
-    @classmethod
-    def from_modules(
-        cls,
-        source: Activations,
-        modules: list[tuple[ComponentType, int]],
-        tokens: TokenSpec,
-    ) -> "PatchConfig":
-        """Create PatchConfig with same tokens for all modules."""
-        return cls(source=source, patches={m: tokens for m in modules})
-
-
-def _make_patch_hooks(
-    model,
-    patch_config: PatchConfig,
-) -> list[FwdHook]:
-    """Create FwdHooks for patching from source activations."""
-    hooks = []
-    component_names = get_all_component_names(model, ["resid", "attn", "mlp"])
-
-    for (comp, layer), tokens in patch_config.patches.items():
-        module_name = component_names[(comp, layer)]
-        # Get source activation at the positions we're patching: [num_tokens, hidden] -> [1, num_tokens, hidden]
-        source_layer = getattr(patch_config.source, comp)[layer]  # [seq_len, hidden]
-        source_tensor = source_layer[tokens].unsqueeze(0)  # [1, num_tokens, hidden]
-
-        hooks.append(FwdHook(
-            module_name=module_name,
-            pos="output",
-            op="replace",
-            tokens=tokens,
-            tensor=source_tensor,
-        ))
-
-    return hooks
-
-
-def fwd_patch(
-    model,
-    inputs: dict[str, Tensor],
-    patch_config: PatchConfig,
-    steer_config: Optional[SteerConfig] = None,
-) -> Float[Tensor, "batch vocab"]:
-    """Forward pass with optional steering and patching.
-
-    Steering hooks are applied first, then patching hooks overwrite.
-    """
-    hooks = []
-
-    # Steering hooks first
-    if steer_config:
-        hooks.append(FwdHook(
-            module_name=get_resid_block_name(model, steer_config.layer),
-            pos="output",
-            op="add",
-            tokens=steer_config.tokens,
-            tensor=scale_vec(steer_config.vec, steer_config.strength),
-        ))
-
-    # Patching hooks second (overwrite steered activations)
-    hooks.extend(_make_patch_hooks(model, patch_config))
-
-    with fwd_with_hooks(hooks, model):
-        outputs = model(**inputs)
-
-    return outputs.logits[:, -1, :]
-
-
-def generate_patch(
-    model,
-    inputs: dict[str, Tensor],
-    patch_config: PatchConfig,
-    steer_config: Optional[SteerConfig] = None,
-    **generate_kwargs,
-) -> Int[Tensor, "batch out_seq"]:
-    """Generate with optional steering and patching.
-
-    Steering hooks are applied first, then patching hooks overwrite.
-    """
-    hooks = []
-
-    if steer_config:
-        hooks.append(FwdHook(
-            module_name=get_resid_block_name(model, steer_config.layer),
-            pos="output",
-            op="add",
-            tokens=steer_config.tokens,
-            tensor=scale_vec(steer_config.vec, steer_config.strength),
-        ))
-
-    hooks.extend(_make_patch_hooks(model, patch_config))
-
-    with fwd_with_hooks(hooks, model):
-        output_ids = model.generate(**inputs, use_cache=True, **generate_kwargs)
-
-    return output_ids
 
 
 # %%
