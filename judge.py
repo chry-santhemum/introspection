@@ -245,17 +245,18 @@ if __name__ == "__main__":
     import asyncio
     LAYER = 38
     # first_n_trials = -1
-    base_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}")
+    base_path = Path(f"refusal_steering/concept_diff-27b-it-L{LAYER}")
+    base_path.mkdir(parents=True, exist_ok=True)
 
     # %%
-    with open(base_path / "steering.json", "r") as f:
+    with open(base_path / "refusal_steering.json", "r") as f:
         all_results = json.load(f)
 
     steer_results = {}
     for k, v in list(all_results.items()):
         steer_results[k] = {}
         for k2, v2 in v.items():
-            if k2 in ["2.0", "3.0", "4.0", "6.0"]:
+            if k2 in ["1.0", "2.0", "3.0", "4.0"]:
                 steer_results[k][k2] = v2
 
     async def run_both():
@@ -311,7 +312,7 @@ if __name__ == "__main__":
 
             scores[word][strength] = total / valid if valid else 0.0
 
-    # plot_judgments_by_word(scores, save_path=base_path / "judge_both.png")
+    plot_judgments_by_word(scores, save_path=base_path / "judge_both.png")
 
     # success words are ones with >= 0.2 success rate at strength=4.0
     success_words = set()
