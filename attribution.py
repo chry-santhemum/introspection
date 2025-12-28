@@ -21,7 +21,7 @@ from utils_model import (
     FwdHook,
     fwd_with_hooks,
     SteerConfig,
-    scale_vec,
+    make_steer_hook,
     Activations,
     fwd_record_all,
     TokenSpec,
@@ -93,7 +93,7 @@ def gradient_attribution(
     model,
     tokenizer,
     inputs: dict,
-    steer_config: Optional[SteerConfig],
+    steer_configs: list[SteerConfig],
     metric: Metric,
     source: Activations,
     components: list[ComponentType] = ["resid", "attn", "mlp"],
@@ -125,14 +125,8 @@ def gradient_attribution(
 
     # Build list of all hooks (record + optional steering)
     all_hooks = list(record_hooks.values())
-    if steer_config:
-        steer_hook = FwdHook(
-            module_name=get_resid_block_name(model, steer_config.layer),
-            pos="output",
-            op="add",
-            tokens=steer_config.tokens,
-            tensor=scale_vec(steer_config.vec, steer_config.strength),
-        )
+    for sc in steer_configs:
+        steer_hook = make_steer_hook(sc, model)
         all_hooks.append(steer_hook)
 
     # We need gradients, so we make the input embeddings require grad
@@ -313,7 +307,6 @@ LAYER = 38
 
 base_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}")
 concept_vectors = torch.load(base_path / "concepts.pt", weights_only=True)
-refusal_vectors = torch.load("attribution/refusal_directions.pt")
 
 inputs = introspection_inputs(
     tokenizer, 
@@ -432,82 +425,3 @@ save_layer_attribution(result, "attribution/steer_to_ctrl", word, LAYER, f"Layer
 # save_layer_attribution(ctrl_to_steer_avg, "attribution/ctrl_to_steer", "averaged", LAYER, f"Averaged Layer Attribution (ctrl → steer, n={n_words})")
 # save_layer_attribution(steer_to_ctrl_avg, "attribution/steer_to_ctrl", "averaged", LAYER, f"Averaged Layer Attribution (steer → ctrl, n={n_words})")
 
-# %%
-
-DEFAULT_REGION_WEIGHTS = {
-    "very_early": 0.02422,  # Layers 0-10
-    "early": 0.00858,       # Layers 11-20
-    "pre_key": 0.00640,     # Layers 21-28
-    "key": 0.01072,         # Layers 29-35
-    "mid": 0.05206,         # Layers 36-47
-    "late": 0.93913,        # Layers 48-55
-    "final": 0.46057,       # Layers 56-61
-}
-
-DEFAULT_REGION_BOUNDARIES = {
-    "very_early_end": 10,   # very_early: 0-10 (inclusive)
-    "early_end": 20,        # early: 11-20
-    "pre_key_end": 28,      # pre_key: 21-28
-    "key_end": 35,          # key: 29-35 (BYPASS ZONE)
-    "mid_end": 47,          # mid: 36-47
-    "late_end": 55,         # late: 48-55
-    # final: 56-61
-}
-
-
-def refusal_ablation_hooks(
-    model,
-    refusal_vectors: Tensor,
-    tokens: TokenSpec,
-) -> list[FwdHook]:
-    """Create proj_ablate hooks for each layer, scaled by region weights."""
-    num_layers = refusal_vectors.shape[0]
-    hooks = []
-
-    def get_layer_region(layer: int) -> str:
-        """Get the region name for a given layer."""
-        boundaries = DEFAULT_REGION_BOUNDARIES
-        if layer <= boundaries["very_early_end"]:
-            return "very_early"
-        elif layer <= boundaries["early_end"]:
-            return "early"
-        elif layer <= boundaries["pre_key_end"]:
-            return "pre_key"
-        elif layer <= boundaries["key_end"]:
-            return "key"
-        elif layer <= boundaries["mid_end"]:
-            return "mid"
-        elif layer <= boundaries["late_end"]:
-            return "late"
-        else:
-            return "final"
-
-    for layer in range(num_layers):
-        region = get_layer_region(layer)
-        weight = DEFAULT_REGION_WEIGHTS[region]
-
-        # Scale the refusal vector by the region weight
-        scaled_vec = refusal_vectors[layer] * weight
-
-        hooks.append(FwdHook(
-            module_name=get_resid_block_name(model, layer),
-            pos="output",
-            op="proj_ablate",
-            tokens=tokens,
-            tensor=scaled_vec,
-        ))
-
-    return hooks
-
-# %%
-word = "Mirrors"
-
-steer_hook = FwdHook(
-    module_name=get_resid_block_name(model, LAYER),
-    pos="output",
-    op="add",
-    tokens=slice(double_newline_pos, None),
-    tensor=scale_vec(concept_vectors[word], 4.0),
-)
-
-source_acts = fwd_record_all(...)
