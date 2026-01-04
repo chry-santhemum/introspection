@@ -1,6 +1,7 @@
 # %%
 import os
 os.environ["HF_HOME"] = "/root/hf"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 import json
 from pathlib import Path
@@ -179,8 +180,14 @@ def batched_steer_with_refusal(
 # %%
 if __name__ == "__main__":
     # Load model and tokenizer
+    # model = load_model(
+    #     model_name="google/gemma-3-27b-it",
+    #     dtype=torch.bfloat16,
+    #     device_map="cuda:0",
+    # )
+
     model = load_model(
-        model_name="google/gemma-3-27b-it",
+        model_name="uzaymacar/gemma-3-27b-abliterated",
         dtype=torch.bfloat16,
         device_map="cuda:0",
     )
@@ -191,7 +198,7 @@ if __name__ == "__main__":
     LAYER = 38
 
     concept_vectors = torch.load(f"concept_vectors/concept_diff-27b-it-L{LAYER}/concepts.pt", weights_only=True)
-    refusal_vectors = torch.load("refusal_steering/refusal_directions.pt", weights_only=True)
+    # refusal_vectors = torch.load("refusal_steering/refusal_directions.pt", weights_only=True)
 
     # %%
     # Prepare inputs and find steering position
@@ -209,12 +216,12 @@ if __name__ == "__main__":
     # %%
     # Create refusal ablation hooks (shared across all generations)
     # These use [hidden] vectors that broadcast to all batch elements
-    refusal_hooks = refusal_ablation_hooks(
-        model=model,
-        refusal_vectors=refusal_vectors,
-        tokens=slice(None),  # Apply to all tokens
-    )
-    print(f"Created {len(refusal_hooks)} refusal ablation hooks")
+    # refusal_hooks = refusal_ablation_hooks(
+    #     model=model,
+    #     refusal_vectors=refusal_vectors,
+    #     tokens=slice(None),  # Apply to all tokens
+    # )
+    # print(f"Created {len(refusal_hooks)} refusal ablation hooks")
 
     # %%
     # Run batched generation with refusal ablation + concept steering
@@ -227,7 +234,7 @@ if __name__ == "__main__":
         words=CONCEPT_WORDS,
         strengths=STRENGTHS,
         concept_vectors=concept_vectors,
-        refusal_hooks=refusal_hooks,
+        refusal_hooks=[],
         num_trials=NUM_TRIALS,
         inputs=inputs,
         model=model,
@@ -241,7 +248,7 @@ if __name__ == "__main__":
 
     # %%
     # Save results
-    save_path = Path(f"refusal_steering/concept_diff-27b-it-L{LAYER}/refusal_steering.json")
+    save_path = Path(f"refusal_steering/concept_diff-27b-it-L{LAYER}/abliterated.json")
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "w") as f:
         json.dump(results, f, indent=2)
