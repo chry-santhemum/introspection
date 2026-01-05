@@ -1,23 +1,18 @@
 # %%
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import torch
 from jaxtyping import Float, Int
-from torch import Tensor
 
-from concept_vectors import introspection_inputs
+from utils_introspection import introspection_template
 from utils_model import (
-    Activations,
-    ComponentType,
-    FwdHook,
     SteerConfig,
+    PatchConfig,
     fwd_record_all,
     fwd_with_hooks,
     load_model,
     load_tokenizer,
-    scale_vec,
 )
 
 
@@ -28,20 +23,20 @@ model = load_model(
     dtype=torch.bfloat16,
     device_map="cuda:0",
 )
-for p in model.parameters():
-    p.requires_grad_(True)
 
+# %%
 tokenizer = load_tokenizer(model_name="google/gemma-3-27b-it")
 
 # %%
 # Load concept vectors
 LAYER = 38
+BATCH_SIZE=32
 
 base_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}")
 concept_vectors = torch.load(base_path / "concepts.pt", weights_only=True)
 
-inputs = introspection_inputs(tokenizer, append=None, prefill=None).to("cuda:0")
-inputs_batched = introspection_inputs(tokenizer, append=None, prefill=None, batch_size=16).to("cuda:0")
+input_str = introspection_template(tokenizer, append=None, prefill=None, trial_idx=1)
+inputs = tokenizer([input_str] * BATCH_SIZE, return_tensors="pt", add_special_tokens=False)
 
 # Find double newline position for steering
 decoded_tokens = [tokenizer.decode(x) for x in inputs["input_ids"][0]]
@@ -56,8 +51,6 @@ AFFIRM_WORDS = ["Algorithms", "Aquariums", "Bread", "Origami", "Satellites", "Tr
 
 success_word = "Bread"
 failure_word = "Mirrors"
-
-no_token_id = tokenizer.encode("No", add_special_tokens=False)[0]
 
 success_steer_config = SteerConfig(
     layer=LAYER,
@@ -76,58 +69,37 @@ failure_steer_config = SteerConfig(
 source_acts = fwd_record_all(
     model=model,
     inputs=inputs,
-    steer_config=success_steer_config,
-    components=["resid", "attn", "mlp"],
+    hooks=[success_steer_config.to_hook(model)],
+    components=["mlp", "resid"],
 )
 
-input_len = inputs["input_ids"].shape[1]
+last_layer_hidden = source_acts.resid[-1, -1, :]
+final_norm = model.model.language_model.norm  # RMSNorm(hidden_dim)
+unembed = model.lm_head.weight  # shape: [vocab_size, hidden_dim]
+logits = unembed @ final_norm(last_layer_hidden)
+
+probs = torch.softmax(logits.float(), dim=-1)
+top_probs, top_indices = torch.topk(probs, k=10)
+print("Top 10 tokens:")
+for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+    token = tokenizer.decode([idx])
+    print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
 
 # %%
 patch_cfg = PatchConfig.from_modules(
     source=source_acts,
-    modules=[("attn", 39)],
-    tokens=[input_len - 1],
+    modules=[("mlp", 45)],
+    tokens=slice(double_newline_pos, None),
 )
 
-logits = fwd_steer(
-    steer_config=success_steer_config,
-    model=model,
-    inputs=inputs,
-)[0]
-probs = torch.softmax(logits.float(), dim=-1)
-top_probs, top_indices = torch.topk(probs, k=10)
-print("Top 10 tokens:")
-for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-    token = tokenizer.decode([idx])
-    print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
+with fwd_with_hooks(patch_cfg.to_hooks(model) + [failure_steer_config.to_hook(model)], model, allow_grad=False):
+    outputs = model.generate(
+        **inputs,
+        use_cache=True,
+        temperature=1.0,
+        max_tokens=100
+    )
 
-# %%
-
-logits = fwd_patch(
-    model=model,
-    inputs=inputs,
-    patch_config=patch_cfg,
-    steer_config=success_steer_config,
-)[0]
-probs = torch.softmax(logits.float(), dim=-1)
-top_probs, top_indices = torch.topk(probs, k=10)
-print("Top 10 tokens:")
-for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-    token = tokenizer.decode([idx])
-    print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
-
-
-# %%
-
-output_tokens = generate_patch(
-    model=model,
-    inputs=introspection_inputs(tokenizer, append=None, prefill="Interestingly").to("cuda:0"),
-    patch_config=patch_cfg,
-    steer_config=failure_steer_config,
-    max_new_tokens=100,
-    temperature=1.0
-)
-
-print(tokenizer.decode(output_tokens[0]))
+print(tokenizer.decode(outputs[0]))
 
 # %%

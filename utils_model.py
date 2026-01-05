@@ -117,9 +117,11 @@ class FwdHook:
     pos: Literal["input", "output"]
     op: Literal["record", "replace", "add", "proj_ablate"]
     tokens: TokenSpec
+
     tensor: Optional[Tensor] = None  # will be broadcast to x[tokens]
-    grad: Optional[Tensor] = None  # populated by backward hook when allow_grad=True.
-                                   # note: this captures grads wrt the modified outputs.
+    grad: Optional[Tensor] = None  
+    # populated when backward() is called in fwd_with_hooks(allow_grad=True).
+    # this captures grads wrt the modified in/outputs.
 
     def __post_init__(self):
         if self.op != "record" and self.tensor is None:
@@ -143,7 +145,7 @@ def _apply_hook_op(h: FwdHook, x: Tensor) -> Optional[Tensor]:
 
     if h.op == "record":
         if h.tensor is None:
-            h.tensor = x[:, idx, :].clone()
+            h.tensor = x[:, idx, :].clone().detach()
         else:
             h.tensor.copy_(x[:, idx, :])
         return None
@@ -171,6 +173,7 @@ def _set_tensor(original, new_tensor):
         return (new_tensor,) + original[1:]
     return new_tensor
 
+
 def make_fwd_hook(h: FwdHook):
     if h.pos == "output":
         def output_hook(module, input, output):
@@ -185,14 +188,19 @@ def make_fwd_hook(h: FwdHook):
 
 
 def make_bwd_hook(h: FwdHook):
-    """Capture output gradients for a FwdHook."""
-    def hook_fn(module, grad_input, grad_output):
-        grad_tensor = grad_output[0]
+    """Capture gradients for a FwdHook."""
+    def grad_hook(module, grad_input, grad_output):
+        if h.pos == "output":
+            grad_tensor = grad_output[0]
+        else:
+            grad_tensor = grad_input[0]
+        
         if grad_tensor is not None:
             idx = h.tokens
             h.grad = grad_tensor[:, idx, :].clone().detach()
+
         return None
-    return hook_fn
+    return grad_hook
 
 
 @contextmanager
@@ -219,7 +227,8 @@ def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
             handles.append(bwd_handle)
 
     if allow_grad:
-        yield
+        with torch.enable_grad():
+            yield
     else:
         with torch.inference_mode():
             yield
@@ -228,36 +237,21 @@ def fwd_with_hooks(hooks: list[FwdHook], model, allow_grad: bool = False):
         handle.remove()
 
 
+# --- Steering and patching hooks ---
 
-# --- Recording activations wrapper ---
+def scale_vec(vec: Tensor, strength: Tensor|float) -> Tensor:
+    """Scale steering vector by strength, then unsqueeze to broadcast to BSH"""
 
-def fwd_record_resid(
-    model,
-    inputs: dict[str, Tensor],
-    layer: int,
-    pos: int = -1,
-) -> Float[Tensor, "batch hidden"]:
-    """Record residual stream activations at a specific layer and position."""
-    module_name = get_resid_block_name(model, layer)
+    if isinstance(strength, (int, float)):
+        scaled = vec * strength
+    else:
+        scaled = vec * strength.unsqueeze(-1)  # strength [batch] → [batch, 1] for broadcasting
 
-    # slice for a single position
-    tokens = slice(pos, pos + 1 if pos != -1 else None)
+    # If result has batch dim, need [batch, 1, hidden] for [batch, seq, hidden] broadcast
+    if scaled.dim() == 2:
+        scaled = scaled.unsqueeze(1)
 
-    record_hook = FwdHook(
-        module_name=module_name,
-        pos="output",
-        op="record",
-        tokens=tokens,
-    )
-
-    with fwd_with_hooks([record_hook], model, allow_grad=False):
-        model(**inputs)
-
-    # record_hook.tensor is [batch, 1, hidden], squeeze to [batch, hidden]
-    return record_hook.tensor.squeeze(1)
-
-
-# --- Steering hooks ---
+    return scaled
 
 @dataclass(kw_only=True)
 class SteerConfig:
@@ -266,33 +260,15 @@ class SteerConfig:
     vec: Tensor  # will be broadcast to x[tokens]
     strength: Tensor|float = 1.0  # scalar or [batch]
 
+    def to_hook(self, model) -> FwdHook:
+        return FwdHook(
+            module_name=get_resid_block_name(model, self.layer),
+            pos="output",
+            op="add",
+            tokens=self.tokens,
+            tensor=scale_vec(self.vec, self.strength),
+        )
 
-def scale_vec(vec: Tensor, strength: Tensor|float) -> Tensor:
-    """Scale steering vector by strength, then unsqueeze to broadcast to BSH"""
-
-    if isinstance(strength, (int, float)):
-        scaled = vec * strength
-    else:
-        # strength [batch] → [batch, 1] for broadcasting
-        scaled = vec * strength.unsqueeze(-1)
-
-    # If result has batch dim, need [batch, 1, hidden] for [batch, seq, hidden] broadcast
-    if scaled.dim() == 2:
-        scaled = scaled.unsqueeze(1)
-
-    return scaled
-
-def make_steer_hook(sc: SteerConfig, model) -> FwdHook:
-    return FwdHook(
-        module_name=get_resid_block_name(model, sc.layer),
-        pos="output",
-        op="add",
-        tokens=sc.tokens,
-        tensor=scale_vec(sc.vec, sc.strength),
-    )
-
-
-# --- Patching hooks ---
 
 @dataclass
 class Activations:
@@ -332,31 +308,55 @@ class PatchConfig:
     ) -> "PatchConfig":
         """Create PatchConfig with same tokens for all modules."""
         return cls(source=source, patches={m: tokens for m in modules})
+    
+    def to_hooks(self, model) -> list[FwdHook]:
+        hooks = []
+        component_names = get_all_component_names(model, ["resid", "attn", "mlp"])
 
+        for (comp, layer), tokens in self.patches.items():
+            module_name = component_names[(comp, layer)]
+            # Get source activation at the positions we're patching: [num_tokens, hidden] -> [1, num_tokens, hidden]
+            source_layer = getattr(self.source, comp)[layer]  # [seq_len, hidden]
+            source_tensor = source_layer[tokens].unsqueeze(0)  # [1, num_tokens, hidden]
 
-def make_patch_hook(patch_config: PatchConfig, model) -> list[FwdHook]:
-    """Create FwdHooks for patching from source activations."""
-    hooks = []
-    component_names = get_all_component_names(model, ["resid", "attn", "mlp"])
+            hooks.append(FwdHook(
+                module_name=module_name,
+                pos="output",
+                op="replace",
+                tokens=tokens,
+                tensor=source_tensor,
+            ))
 
-    for (comp, layer), tokens in patch_config.patches.items():
-        module_name = component_names[(comp, layer)]
-        # Get source activation at the positions we're patching: [num_tokens, hidden] -> [1, num_tokens, hidden]
-        source_layer = getattr(patch_config.source, comp)[layer]  # [seq_len, hidden]
-        source_tensor = source_layer[tokens].unsqueeze(0)  # [1, num_tokens, hidden]
-
-        hooks.append(FwdHook(
-            module_name=module_name,
-            pos="output",
-            op="replace",
-            tokens=tokens,
-            tensor=source_tensor,
-        ))
-
-    return hooks
+        return hooks
 
 
 # --- Activation recording ---
+
+def fwd_record_resid(
+    model,
+    inputs: dict[str, Tensor],
+    layer: int,
+    pos: int = -1,
+) -> Float[Tensor, "batch hidden"]:
+    """Record residual stream activations at a specific layer and position."""
+    module_name = get_resid_block_name(model, layer)
+
+    # slice for a single position
+    tokens = slice(pos, pos + 1 if pos != -1 else None)
+
+    record_hook = FwdHook(
+        module_name=module_name,
+        pos="output",
+        op="record",
+        tokens=tokens,
+    )
+
+    with fwd_with_hooks([record_hook], model, allow_grad=False):
+        model(**inputs)
+
+    # record_hook.tensor is [batch, 1, hidden], squeeze to [batch, hidden]
+    return record_hook.tensor.squeeze(1)
+
 
 def fwd_record_all(
     model,

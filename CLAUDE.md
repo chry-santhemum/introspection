@@ -2,9 +2,11 @@
 
 This is a codebase where I study the mechanisms of the following introspection property of large language models:
 
+- We take a *concept vector* about a well-defind concept. The vector is obtained from taking mean activation differences at a given layer.
 
-- We take a *concept vector* obtained from 
+- We give the model a prompt (two turns, `HUMAN_PROMPT_1` and `HUMAN_PROMPT_2` from `concept_vectors.py`) asking it whether the model detects an injected thought. We steer the model at the same layer with this concept vector.
 
+- With a nontrivial percentage, the model would report that it does detect an injected thought (and correctly identify the concept), while at the same time not exhibiting false positives (i.e. without the concept steering, the model never says it detects an injected thought).
 
 ## Meta: How to update this file
 
