@@ -107,6 +107,16 @@ def get_all_component_names(model, components: list[ComponentType]) -> dict[tupl
     return result
 
 
+def print_top_tokens(logits: Tensor, tokenizer, top_k: int=10) -> None:
+    """Print top_k most probable tokens"""
+    probs = torch.softmax(logits.float(), dim=-1)
+    top_probs, top_indices = torch.topk(probs, k=top_k)
+    print(f"Top {top_k} tokens:")
+    for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+        token = tokenizer.decode([idx])
+        print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
+
+
 # --- Forward hook configuration ---
 
 TokenSpec = Union[list[int], slice]

@@ -3,11 +3,14 @@
     "allow": [
       "mcp__ide__getDiagnostics",
       "Bash(python -m py_compile:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(source ~/.venv/bin/activate)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "orchestra-mcp"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

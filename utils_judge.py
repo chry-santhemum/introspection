@@ -11,7 +11,6 @@ RETRY_CONFIG = RetryConfig(
     criteria=lambda response: response.has_response and response.finish_reason == "stop",
     max_attempts=3,
 )
-caller = AutoCaller(dotenv_path=".env", retry_config=RETRY_CONFIG, force_caller="openrouter")
 
 # original prompts
 
@@ -148,8 +147,10 @@ def parse_binary_response(resp: Response) -> bool | None:
 
 
 async def judge_introspection(
+    caller,
     rollouts: dict[str, list[str]],  # word -> list of rollout texts
     judge_prompt: str,
+    key_to_word: dict[str, str]|None,
     judge_model: str = "openai/gpt-5-mini",
     max_par: int = 512,
     max_tokens: int=8192,
@@ -157,15 +158,15 @@ async def judge_introspection(
 ) -> dict[str, list[bool | None]]:
     judge_prompts = []
     tasks = []
-    for word, word_rollouts in rollouts.items():
-        for trial_idx, text in enumerate(word_rollouts):
+    for key, key_rollouts in rollouts.items():
+        for trial_idx, text in enumerate(key_rollouts):
             judge_prompt_formatted = judge_prompt.format(
                 prompt=USER_PROMPT,
                 response=text,
-                word=word,
+                word=key_to_word[key] if key_to_word else key,
             )
             judge_prompts.append(judge_prompt_formatted)
-            tasks.append((word, trial_idx))
+            tasks.append((key, trial_idx))
 
     responses = await caller.call(
         messages=judge_prompts,
@@ -178,8 +179,8 @@ async def judge_introspection(
     )
 
     judgments: dict[str, list[bool | None]] = {
-        word: [None] * len(word_rollouts)
-        for word, word_rollouts in rollouts.items()
+        key: [None] * len(key_rollouts)
+        for key, key_rollouts in rollouts.items()
     }
 
     for resp, task in zip(responses, tasks):
@@ -189,18 +190,27 @@ async def judge_introspection(
     return judgments
 
 
-async def judge_main(steer_results: dict[str, list[str]], base_path: Path):
+async def judge_main(
+    caller,
+    steer_results: dict[str, list[str]], 
+    base_path: Path,
+    key_to_word: dict[str, str]|None = None,
+) -> dict[str, float]:
     judgments_detection = await judge_introspection(
+        caller,
         steer_results,
         judge_prompt=JUDGE_DETECTION_IDENTIFICATION,
+        key_to_word=key_to_word,
     )
 
     with open(base_path / "judgments_detection.json", "w") as f:
         json.dump(judgments_detection, f, indent=4)
 
     judgments_coherence = await judge_introspection(
+        caller,
         steer_results,
         judge_prompt=JUDGE_COHERENCE,
+        key_to_word=key_to_word,
     )
 
     with open(base_path / "judgments_coherence.json", "w") as f:
@@ -221,3 +231,8 @@ async def judge_main(steer_results: dict[str, list[str]], base_path: Path):
                 total += 1
 
         scores[word] = total / valid if valid else 0.0
+
+    with open(base_path / "judge_scores.json", "w") as f:
+        json.dump(scores, f, indent=4)
+    
+    return scores

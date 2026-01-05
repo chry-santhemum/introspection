@@ -10,7 +10,8 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from concept_vectors import introspection_inputs, CONCEPT_WORDS
+from concept_vectors import CONCEPT_WORDS
+from utils_introspection import introspection_template
 from utils_model import (
     load_model,
     load_tokenizer,
@@ -18,7 +19,6 @@ from utils_model import (
     FwdHook,
     fwd_with_hooks,
     SteerConfig,
-    make_steer_hook,
     TokenSpec,
 )
 
@@ -154,7 +154,7 @@ def batched_steer_with_refusal(
                 vec=batch_vecs,          # [batch, hidden]
                 strength=batch_strengths, # [batch]
             )
-            steer_hook = make_steer_hook(steer_config, model)
+            steer_hook = steer_config.to_hook(model)
 
             # Combine: refusal hooks (shared, broadcast) + steer hook (batched)
             all_hooks = refusal_hooks + [steer_hook]
@@ -202,7 +202,8 @@ if __name__ == "__main__":
 
     # %%
     # Prepare inputs and find steering position
-    inputs = introspection_inputs(tokenizer, append=None, prefill=None)
+    input_str = introspection_template(tokenizer, append=None, prefill=None)
+    inputs = tokenizer(input_str, return_tensors="pt", add_special_tokens=False)
 
     # Find double newline position for steering
     decoded_tokens = [tokenizer.decode(x) for x in inputs["input_ids"][0]]

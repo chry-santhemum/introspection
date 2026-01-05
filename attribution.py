@@ -17,16 +17,16 @@ from utils_model import (
     get_resid_block_name,
     get_num_layers,
     get_all_component_names,
+    print_top_tokens,
     ComponentType,
     FwdHook,
     fwd_with_hooks,
     SteerConfig,
-    make_steer_hook,
     Activations,
     fwd_record_all,
     TokenSpec,
 )
-from concept_vectors import introspection_inputs
+from utils_introspection import introspection_template
 
 
 # --- Attribution computation ---
@@ -36,10 +36,6 @@ Metric = Callable[[Tensor], Tensor]
 
 
 def logit_metric(model, token_id: int) -> Metric:
-    """Create a metric that returns the logit for a specific token.
-
-    Applies the model's final norm and lm_head to get logits.
-    """
     def metric(hidden: Tensor) -> Tensor:
         logits = model.lm_head(hidden)
         return logits[token_id]
@@ -47,7 +43,6 @@ def logit_metric(model, token_id: int) -> Metric:
 
 
 def logit_diff_metric(model, pos_token_id: int, neg_token_id: int) -> Metric:
-    """Create a metric for the difference between two token logits."""
     def metric(hidden: Tensor) -> Tensor:
         logits = model.lm_head(hidden)
         return logits[pos_token_id] - logits[neg_token_id]
@@ -55,7 +50,6 @@ def logit_diff_metric(model, pos_token_id: int, neg_token_id: int) -> Metric:
 
 
 def projection_metric(direction: Tensor) -> Metric:
-    """Create a metric that returns the projection onto a direction vector."""
     def metric(hidden: Tensor) -> Tensor:
         # Normalize direction and compute dot product
         direction_normalized = direction / direction.norm()
@@ -92,12 +86,12 @@ class AttributionResult:
 def gradient_attribution(
     model,
     tokenizer,
-    inputs: dict,
-    steer_configs: list[SteerConfig],
+    inputs: dict[str, Tensor],
+    hooks: list[FwdHook],
     metric: Metric,
     source: Activations,
     components: list[ComponentType] = ["resid", "attn", "mlp"],
-    attr_start_pos: int = 0,
+    attribution_start_pos: int = 0,
 ) -> AttributionResult:
     """Gradient-based attribution for activation patching approximation.
 
@@ -110,7 +104,7 @@ def gradient_attribution(
     module_names = get_all_component_names(model, components)
 
     full_seq_len = inputs["input_ids"].shape[1]
-    attr_seq_len = full_seq_len - attr_start_pos
+    attr_seq_len = full_seq_len - attribution_start_pos
 
     # Create record hooks for all components
     record_hooks = {
@@ -118,24 +112,20 @@ def gradient_attribution(
             module_name=module_name,
             pos="output",
             op="record",
-            tokens=slice(None),  # Record all positions (need full for gradient flow)
+            tokens=slice(None),
         )
         for key, module_name in module_names.items()
     }
-
-    # Build list of all hooks (record + optional steering)
     all_hooks = list(record_hooks.values())
-    for sc in steer_configs:
-        steer_hook = make_steer_hook(sc, model)
-        all_hooks.append(steer_hook)
+    all_hooks.extend(hooks)
 
-    # We need gradients, so we make the input embeddings require grad
-    # This ensures the computation graph is built
+    # make the input embeddings require grad
+    # in order to ensure gradients are propagated
     input_ids = inputs["input_ids"]
     inputs_embeds = model.get_input_embeddings()(input_ids)
     inputs_embeds = inputs_embeds.detach().requires_grad_(True)
 
-    # Prepare inputs without input_ids (use inputs_embeds instead)
+    # use inputs_embeds instead of input_ids
     fwd_inputs = {k: v for k, v in inputs.items() if k != "input_ids"}
     fwd_inputs["inputs_embeds"] = inputs_embeds
 
@@ -143,34 +133,25 @@ def gradient_attribution(
     with fwd_with_hooks(all_hooks, model, allow_grad=True):
         outputs = model(**fwd_inputs, output_hidden_states=True)
 
-        # # Print top 10 most probable tokens
-        # logits = outputs.logits[0, -1, :]  # [vocab]
-        # probs = torch.softmax(logits.float(), dim=-1)
-        # top_probs, top_indices = torch.topk(probs, k=10)
-        # print("Top 10 tokens:")
-        # for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-        #     token = tokenizer.decode([idx])
-        #     print(f"  {i+1:>3}. {repr(token):20s} prob={prob.item():<10.6f} logit={logits[idx].item():<8.2f}")
-
         # Compute metric and backward
         metric_value = metric(outputs.hidden_states[-1][0, -1, :])
         metric_value.backward()
 
     # Compute attribution: grad · (activation - source)
-    # Only for positions from attr_start_pos onwards
+    # Only for positions from attribution_start_pos onwards
     attribution = {comp: torch.zeros(num_layers, attr_seq_len) for comp in components}
 
     for key, hook in record_hooks.items():
         comp, layer = key
         act = hook.tensor  # [1, full_seq, hidden]
-        grad = hook.grad  # [1, full_seq, hidden] - captured by backward hook
+        grad = hook.grad  # [1, full_seq, hidden]
 
         if grad is None:
             print(f"Warning: No gradient for {comp} layer {layer}")
             continue
 
-        # Attribution at each position from attr_start_pos onwards
-        for i, pos in enumerate(range(attr_start_pos, full_seq_len)):
+        # Attribution at each position from attribution_start_pos onwards
+        for i, pos in enumerate(range(attribution_start_pos, full_seq_len)):
             act_pos = act[0, pos, :]  # [hidden]
             grad_pos = grad[0, pos, :]  # [hidden]
             base = source.get_at(comp, layer, pos).to(device)  # [hidden]
@@ -179,8 +160,8 @@ def gradient_attribution(
             attr = (grad_pos * diff).sum().item()
             attribution[comp][layer, i] = attr
 
-    # Get token strings for metadata (only from attr_start_pos onwards)
-    tokens = [tokenizer.decode([tid]) for tid in input_ids[0, attr_start_pos:].tolist()]
+    # Get token strings for metadata (only from attribution_start_pos onwards)
+    tokens = [tokenizer.decode([tid]) for tid in input_ids[0, attribution_start_pos:].tolist()]
 
     return AttributionResult(
         resid=attribution.get("resid", torch.zeros(num_layers, attr_seq_len)),
@@ -271,35 +252,21 @@ def save_layer_attribution(
 # %% --- Experiment script ---
 
 # Load model and tokenizer
+base_model = load_model(
+    model_name="google/gemma-3-27b-pt",
+    dtype=torch.bfloat16,
+    device_map="cuda:0",
+)
+for p in base_model.parameters():
+    p.requires_grad_(True)
+
 model = load_model(
     model_name="google/gemma-3-27b-it",
     dtype=torch.bfloat16,
     device_map="cuda:0",
 )
-for p in model.parameters():
-    p.requires_grad_(True)
 
 tokenizer = load_tokenizer(model_name="google/gemma-3-27b-it")
-
-# wikitext = load_dataset("Salesforce/wikitext", name="wikitext-2-v1", split="train")
-# ultrachat = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
-
-# def preprocess_item(item: dict):
-#     formatted_text = tokenizer.apply_chat_template(item["messages"], tokenize=False)
-#     return {"text": formatted_text}
-
-# ultrachat_to_use = ultrachat.select(range(5000)).map(preprocess_item, num_proc=8)
-
-# mean_acts = compute_mean_activations(
-#     model, 
-#     tokenizer,
-#     ultrachat_to_use,
-# )
-
-# print(f"Mean activations shape: resid={mean_acts.resid.shape}, attn={mean_acts.attn.shape}, mlp={mean_acts.mlp.shape}")
-
-# # Save mean activations for reuse
-# torch.save(mean_acts, "attribution/mean_acts-27b-it.pt")
 
 # %%
 # Load concept vectors
@@ -308,11 +275,8 @@ LAYER = 38
 base_path = Path(f"concept_vectors/concept_diff-27b-it-L{LAYER}")
 concept_vectors = torch.load(base_path / "concepts.pt", weights_only=True)
 
-inputs = introspection_inputs(
-    tokenizer, 
-    append=None,
-    prefill=None
-).to("cuda:0")
+input_str = introspection_template(tokenizer, append=None, prefill=None)
+inputs = tokenizer(input_str, return_tensors="pt").to("cuda:0")
 
 # Find double newline position for steering
 decoded_tokens = [tokenizer.decode(x) for x in inputs["input_ids"][0]]
@@ -343,12 +307,9 @@ success_steer_config = SteerConfig(
     strength=4.0,
 )
 
-steered_logits = fwd_steer(
-    steer_config=success_steer_config,
-    model=model,
-    inputs=inputs
-)
-logits = steered_logits[0]
+with fwd_with_hooks([success_steer_config.to_hook(model)], model):
+    outputs = model(**inputs)
+logits = outputs.logits[0, -1, :]
 top_token_id = int(torch.argmax(logits).item())
 top_token = tokenizer.decode([top_token_id])
 print(f"Top token: {top_token}")
@@ -360,7 +321,7 @@ metric=logit_diff_metric(model, top_token_id, no_token_id)
 source_acts = fwd_record_all(
     model=model,
     inputs=inputs,
-    steer_config=success_steer_config,
+    hooks=[success_steer_config.to_hook(model)],
     components=["resid", "attn", "mlp"],
 )
 
@@ -375,10 +336,10 @@ result = gradient_attribution(
     model=model,
     tokenizer=tokenizer,
     inputs=inputs,
-    steer_config=failure_steer_config,
+    steer_configs=[failure_steer_config],
     metric=metric,
     source=source_acts,
-    attr_start_pos=double_newline_pos,
+    attribution_start_pos=double_newline_pos,
 )
 
 # # Accumulate layer-wise attribution (sum over tokens)
@@ -386,42 +347,23 @@ result = gradient_attribution(
 # for comp in agg:
 #     ctrl_to_steer_accum[comp] += agg[comp]
 
-save_attribution_heatmaps(result, "attribution/success_to_failure", f"{success_word}_to_{failure_word}", LAYER, f"(logit({top_token}) - logit(No) = {result.metric_value:.2f})")
-save_layer_attribution(result, "attribution/success_to_failure", f"{success_word}_to_{failure_word}", LAYER, f"Layer Attribution (logit({top_token}) - logit(No) = {result.metric_value:.2f})")
 
+# wikitext = load_dataset("Salesforce/wikitext", name="wikitext-2-v1", split="train")
+# ultrachat = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
 
-# %%
-# steer to ctrl
-source_acts = fwd_record_all(
-    model=model,
-    inputs=inputs,
-    steer_config=steer_config,
-    components=["resid", "attn", "mlp"],
-)
+# def preprocess_item(item: dict):
+#     formatted_text = tokenizer.apply_chat_template(item["messages"], tokenize=False)
+#     return {"text": formatted_text}
 
-result = gradient_attribution(
-    model=model,
-    tokenizer=tokenizer,
-    inputs=inputs,
-    steer_config=None,
-    metric=metric,
-    source=source_acts,
-    attr_start_pos=double_newline_pos,
-)
+# ultrachat_to_use = ultrachat.select(range(5000)).map(preprocess_item, num_proc=8)
 
-# Accumulate layer-wise attribution (sum over tokens)
-agg = result.aggregate(method="sum")
-for comp in agg:
-    steer_to_ctrl_accum[comp] += agg[comp]
+# mean_acts = compute_mean_activations(
+#     model, 
+#     tokenizer,
+#     ultrachat_to_use,
+# )
 
-save_attribution_heatmaps(result, "attribution/steer_to_ctrl", word, LAYER, f"(logit({top_token}) - logit(No) = {result.metric_value:.2f})")
-save_layer_attribution(result, "attribution/steer_to_ctrl", word, LAYER, f"Layer Attribution (logit({top_token}) - logit(No) = {result.metric_value:.2f})")
+# print(f"Mean activations shape: resid={mean_acts.resid.shape}, attn={mean_acts.attn.shape}, mlp={mean_acts.mlp.shape}")
 
-# # Average over all words and save
-# n_words = len(AFFIRM_WORDS)
-# ctrl_to_steer_avg: dict[ComponentType, Tensor] = {c: ctrl_to_steer_accum[c] / n_words for c in COMPONENTS}
-# steer_to_ctrl_avg: dict[ComponentType, Tensor] = {c: steer_to_ctrl_accum[c] / n_words for c in COMPONENTS}
-
-# save_layer_attribution(ctrl_to_steer_avg, "attribution/ctrl_to_steer", "averaged", LAYER, f"Averaged Layer Attribution (ctrl → steer, n={n_words})")
-# save_layer_attribution(steer_to_ctrl_avg, "attribution/steer_to_ctrl", "averaged", LAYER, f"Averaged Layer Attribution (steer → ctrl, n={n_words})")
-
+# # Save mean activations for reuse
+# torch.save(mean_acts, "attribution/mean_acts-27b-it.pt")
