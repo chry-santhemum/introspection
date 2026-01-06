@@ -219,9 +219,6 @@ async def run_all_judging():
     print("="*60)
 
 
-def main():
-    asyncio.run(run_all_judging())
-
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_all_judging())
