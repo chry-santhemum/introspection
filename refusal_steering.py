@@ -10,8 +10,10 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from caller import AutoCaller
 from concept_vectors import CONCEPT_WORDS
 from utils_introspection import introspection_template
+from utils_judge import judge_main, RETRY_CONFIG
 from utils_model import (
     load_model,
     load_tokenizer,
@@ -23,6 +25,7 @@ from utils_model import (
 )
 
 
+# %%
 # --- Refusal ablation configuration ---
 
 DEFAULT_REGION_WEIGHTS = {
@@ -262,5 +265,172 @@ if __name__ == "__main__":
             print(f"  strength={strength}:")
             for i, text in enumerate(results[word][strength][:1]):
                 print(f"    [{i}] {text[:150]}...")
+
+
+# %%
+import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+caller = AutoCaller(dotenv_path=".env", retry_config=RETRY_CONFIG, force_caller="openai")
+
+with open("refusal_steering/27b-it-L38-abliterated/abliterated.json", "r") as f:
+    steer_results = json.load(f)
+
+steer_results_combined = {}
+for word, word_rollouts in steer_results.items():
+    for strength, strength_rollouts in word_rollouts.items():
+        steer_results_combined[word + "_" + strength] = strength_rollouts
+
+judge_scores = asyncio.run(judge_main(
+    caller,
+    steer_results=steer_results_combined,
+    base_path=Path("refusal_steering/27b-it-L38-steered"),
+    key_to_word={k: k.split("_")[0] for k in steer_results_combined.keys()},
+))
+
+
+# %%
+# Compare introspection rates: baseline vs abliterated model
+import matplotlib.pyplot as plt
+
+# Load baseline judgments (regular model) - detection AND coherence
+with open("concept_vectors/concept_diff-27b-it-L38/judge_affirmative_identification.json", "r") as f:
+    baseline_detection = json.load(f)
+with open("concept_vectors/concept_diff-27b-it-L38/judge_coherence.json", "r") as f:
+    baseline_coherence = json.load(f)
+
+# Load steered judgments - detection AND coherence
+with open("refusal_steering/27b-it-L38-steered/judge_affirmative_identification.json", "r") as f:
+    steered_detection = json.load(f)
+with open("refusal_steering/27b-it-L38-steered/judge_coherence.json", "r") as f:
+    steered_coherence = json.load(f)
+
+# Compute introspection rates (detection AND coherence)
+def compute_rates(
+    detection: dict, coherence: dict, strengths: list[str]
+) -> dict[str, dict[str, float]]:
+    """Compute introspection rate requiring both detection=True and coherence=True."""
+    rates = {}
+    for word in detection.keys():
+        rates[word] = {}
+        for strength in strengths:
+            if strength in detection.get(word, {}) and strength in coherence.get(word, {}):
+                det_scores = detection[word][strength]
+                coh_scores = coherence[word][strength]
+                valid_pairs = [
+                    (d, c) for d, c in zip(det_scores, coh_scores)
+                    if d is not None and c is not None
+                ]
+                if valid_pairs:
+                    successes = sum(1 for d, c in valid_pairs if d and c)
+                    rates[word][strength] = successes / len(valid_pairs)
+                else:
+                    rates[word][strength] = 0.0
+    return rates
+
+# Common strengths between both datasets
+COMMON_STRENGTHS = ["2.0", "3.0", "4.0"]
+
+baseline_rates = compute_rates(baseline_detection, baseline_coherence, COMMON_STRENGTHS)
+steered_rates = compute_rates(steered_detection, steered_coherence, COMMON_STRENGTHS)
+
+# Get common words (should be the same, but intersect to be safe)
+common_words = sorted(set(baseline_rates.keys()) & set(steered_rates.keys()))
+
+# Create figure with subplots
+fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+for ax, strength in zip(axes, COMMON_STRENGTHS):
+    # Extract rates for this strength
+    x_baseline = [baseline_rates[w].get(strength, 0) for w in common_words]
+    y_steered = [steered_rates[w].get(strength, 0) for w in common_words]
+
+    # Plot scatter
+    ax.scatter(x_baseline, y_steered, alpha=0.6, s=30)
+
+    # Add diagonal reference line
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, lw=1)
+
+    # Labels and title
+    ax.set_xlabel("Baseline rate")
+    ax.set_ylabel("Steered rate")
+    ax.set_title(f"Strength = {strength}")
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+plt.suptitle("Introspection rates: Baseline vs Refusal steered model", y=1.02)
+plt.tight_layout()
+plt.savefig("refusal_steering/27b-it-L38-steered/introspection_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# Print summary statistics
+print("\nSummary: Mean introspection rate")
+print(f"{'Strength':<10} {'Baseline':<12} {'Steered':<12} {'Δ':<10}")
+print("-" * 44)
+for strength in COMMON_STRENGTHS:
+    baseline_mean = sum(baseline_rates[w].get(strength, 0) for w in common_words) / len(common_words)
+    steered_mean = sum(steered_rates[w].get(strength, 0) for w in common_words) / len(common_words)
+    delta = steered_mean - baseline_mean
+    print(f"{strength:<10} {baseline_mean:<12.4f} {steered_mean:<12.4f} {delta:+.4f}")
+
+# %%
+# Plot for abliterated model (different JSON format: flat keys like "Word_strength")
+with open("refusal_steering/27b-it-L38-abliterated/judgments_detection.json", "r") as f:
+    abliterated_detection_flat = json.load(f)
+with open("refusal_steering/27b-it-L38-abliterated/judgments_coherence.json", "r") as f:
+    abliterated_coherence_flat = json.load(f)
+
+# Convert flat format to nested format
+def flat_to_nested(flat_judgments: dict) -> dict[str, dict[str, list]]:
+    """Convert {Word_strength: [...]} to {Word: {strength: [...]}}."""
+    nested = {}
+    for key, scores in flat_judgments.items():
+        word, strength = key.rsplit("_", 1)
+        if word not in nested:
+            nested[word] = {}
+        nested[word][strength] = scores
+    return nested
+
+abliterated_detection_nested = flat_to_nested(abliterated_detection_flat)
+abliterated_coherence_nested = flat_to_nested(abliterated_coherence_flat)
+abliterated_rates = compute_rates(
+    abliterated_detection_nested, abliterated_coherence_nested, COMMON_STRENGTHS
+)
+
+common_words_2 = sorted(set(baseline_rates.keys()) & set(abliterated_rates.keys()))
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+for ax, strength in zip(axes, COMMON_STRENGTHS):
+    x_baseline = [baseline_rates[w].get(strength, 0) for w in common_words_2]
+    y_abliterated = [abliterated_rates[w].get(strength, 0) for w in common_words_2]
+
+    ax.scatter(x_baseline, y_abliterated, alpha=0.6, s=30)
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, lw=1)
+
+    ax.set_xlabel("Baseline rate")
+    ax.set_ylabel("Abliterated rate")
+    ax.set_title(f"Strength = {strength}")
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+plt.suptitle("Introspection rates: Baseline vs Abliterated model", y=1.02)
+plt.tight_layout()
+plt.savefig("refusal_steering/27b-it-L38-abliterated/introspection_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\nSummary: Mean introspection rate (Abliterated)")
+print(f"{'Strength':<10} {'Baseline':<12} {'Abliterated':<12} {'Δ':<10}")
+print("-" * 44)
+for strength in COMMON_STRENGTHS:
+    baseline_mean = sum(baseline_rates[w].get(strength, 0) for w in common_words_2) / len(common_words_2)
+    abliterated_mean = sum(abliterated_rates[w].get(strength, 0) for w in common_words_2) / len(common_words_2)
+    delta = abliterated_mean - baseline_mean
+    print(f"{strength:<10} {baseline_mean:<12.4f} {abliterated_mean:<12.4f} {delta:+.4f}")
 
 # %%
