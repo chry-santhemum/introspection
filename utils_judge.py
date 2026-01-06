@@ -2,6 +2,7 @@
 import json
 from textwrap import dedent
 from pathlib import Path
+from typing import Literal
 import matplotlib.pyplot as plt
 
 from caller import AutoCaller, RetryConfig, Response
@@ -153,8 +154,9 @@ async def judge_introspection(
     key_to_word: dict[str, str]|None,
     judge_model: str = "openai/gpt-5-mini",
     max_par: int = 512,
-    max_tokens: int=8192,
-    reasoning: str|int="medium"
+    max_tokens: int = 8192,
+    reasoning: str | int = "medium",
+    enable_cache: bool = True,
 ) -> dict[str, list[bool | None]]:
     judge_prompts = []
     tasks = []
@@ -175,7 +177,7 @@ async def judge_introspection(
         desc="LLM judge",
         max_tokens=max_tokens,
         reasoning=reasoning,
-        # enable_cache=False,
+        enable_cache=enable_cache,
     )
 
     judgments: dict[str, list[bool | None]] = {
@@ -192,15 +194,24 @@ async def judge_introspection(
 
 async def judge_main(
     caller,
-    steer_results: dict[str, list[str]], 
+    steer_results: dict[str, list[str]],
     base_path: Path,
     key_to_word: dict[str, str]|None = None,
+    judge_type: Literal["detection_identification", "detection"] = "detection_identification",
+    judge_model: str = "openai/gpt-5-mini",
+    reasoning: str | int = "medium",
+    enable_cache: bool = True,
 ) -> dict[str, float]:
+    judge_prompt = JUDGE_DETECTION_IDENTIFICATION if judge_type == "detection_identification" else JUDGE_DETECTION
+
     judgments_detection = await judge_introspection(
         caller,
         steer_results,
-        judge_prompt=JUDGE_DETECTION_IDENTIFICATION,
+        judge_prompt=judge_prompt,
         key_to_word=key_to_word,
+        judge_model=judge_model,
+        reasoning=reasoning,
+        enable_cache=enable_cache,
     )
 
     with open(base_path / "judgments_detection.json", "w") as f:
@@ -211,6 +222,9 @@ async def judge_main(
         steer_results,
         judge_prompt=JUDGE_COHERENCE,
         key_to_word=key_to_word,
+        judge_model=judge_model,
+        reasoning=reasoning,
+        enable_cache=enable_cache,
     )
 
     with open(base_path / "judgments_coherence.json", "w") as f:
