@@ -199,6 +199,8 @@ async def judge_main(
     key_to_word: dict[str, str]|None = None,
     judge_type: Literal["detection_identification", "detection"] = "detection_identification",
     judge_model: str = "openai/gpt-5-mini",
+    max_par: int = 512,
+    max_tokens: int = 8192,
     reasoning: str | int = "medium",
     enable_cache: bool = True,
 ) -> dict[str, float]:
@@ -210,6 +212,8 @@ async def judge_main(
         judge_prompt=judge_prompt,
         key_to_word=key_to_word,
         judge_model=judge_model,
+        max_par=max_par,
+        max_tokens=max_tokens,
         reasoning=reasoning,
         enable_cache=enable_cache,
     )
@@ -223,6 +227,8 @@ async def judge_main(
         judge_prompt=JUDGE_COHERENCE,
         key_to_word=key_to_word,
         judge_model=judge_model,
+        max_par=max_par,
+        max_tokens=max_tokens,
         reasoning=reasoning,
         enable_cache=enable_cache,
     )

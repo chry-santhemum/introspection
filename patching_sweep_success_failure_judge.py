@@ -19,13 +19,6 @@ from patching_sweep_success_failure_rollouts import (
 )
 
 
-# --- Judge configuration ---
-
-JUDGE_MODEL = "openai/gpt-5-nano"
-REASONING = "medium"
-ENABLE_CACHE = False
-
-
 # --- Helper functions ---
 
 def create_key_to_word_mapping(
@@ -150,7 +143,7 @@ async def run_all_judging():
         force_caller="openrouter",
     )
 
-    for experiment in EXPERIMENTS:
+    for experiment in EXPERIMENTS[3:]:
         print(f"\n{'='*60}")
         print(f"Judging experiment: {experiment['name']}")
         print(f"{'='*60}")
@@ -191,9 +184,11 @@ async def run_all_judging():
                 base_path=layer_dir,
                 key_to_word=key_to_word,
                 judge_type=experiment["judge_type"],
-                judge_model=JUDGE_MODEL,
-                reasoning=REASONING,
-                enable_cache=ENABLE_CACHE,
+                judge_model="openai/gpt-5-nano",
+                max_par=1024,
+                max_tokens=4096,
+                reasoning="low",
+                enable_cache=False,
             )
 
             all_layer_scores[patch_layer] = scores
