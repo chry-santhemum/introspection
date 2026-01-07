@@ -3,9 +3,8 @@ import json
 from textwrap import dedent
 from pathlib import Path
 from typing import Literal, Sequence
-import matplotlib.pyplot as plt
 
-from caller import AutoCaller, RetryConfig, Response
+from caller import RetryConfig, Response
 
 RETRY_CONFIG = RetryConfig(
     raise_when_exhausted=False,
@@ -191,6 +190,7 @@ async def judge_introspection(
 
     return judgments
 
+
 JudgeType = Literal["detection_identification", "detection", "coherence"]
 
 async def judge_main(
@@ -204,7 +204,9 @@ async def judge_main(
     max_tokens: int = 8192,
     reasoning: str | int = "medium",
     enable_cache: bool = True,
-) -> dict[str, float]:
+) -> dict[JudgeType, dict[str, list[bool | None]]]:
+
+    all_results = {}
 
     for jt in judge_type:
         match jt:
@@ -223,45 +225,15 @@ async def judge_main(
             judge_prompt=judge_prompt,
             key_to_word=key_to_word,
             judge_model=judge_model,
+            max_par=max_par,
+            max_tokens=max_tokens,
             reasoning=reasoning,
             enable_cache=enable_cache,
         )
 
         with open(base_path / f"judgments_{jt}.json", "w") as f:
             json.dump(judgments, f, indent=4)
-
-    judgments_coherence = await judge_introspection(
-        caller,
-        steer_results,
-        judge_prompt=JUDGE_COHERENCE,
-        key_to_word=key_to_word,
-        judge_model=judge_model,
-        max_par=max_par,
-        max_tokens=max_tokens,
-        reasoning=reasoning,
-        enable_cache=enable_cache,
-    )
-
-    with open(base_path / "judgments_coherence.json", "w") as f:
-        json.dump(judgments_coherence, f, indent=4)
-
-    scores: dict[str, float] = {}
-    for word in judgments_detection.keys():
-        detection_scores = judgments_detection[word]
-        coherence_scores = judgments_coherence[word]
         
-        total = 0
-        valid = 0
-        for det, coh in zip(detection_scores, coherence_scores):
-            if det is None or coh is None:
-                continue
-            valid += 1
-            if det and coh:
-                total += 1
+        all_results[jt] = judgments
 
-        scores[word] = total / valid if valid else 0.0
-
-    with open(base_path / "judge_scores.json", "w") as f:
-        json.dump(scores, f, indent=4)
-    
-    return scores
+    return all_results

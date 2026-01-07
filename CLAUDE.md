@@ -35,6 +35,8 @@ This is a codebase where I study the mechanisms of the following introspection p
 
 - [2025-01-04] Be proactive: do the task including obvious follow-ups. Only pause to confirm when multiple valid approaches exist, you'd delete/restructure code significantly, or you genuinely don't understand.
 
+- [2026-01-07] Do not print diagrams or ASCII schematics with width above 80 characters.
+
 
 ## Code style
 
@@ -49,6 +51,10 @@ This is a codebase where I study the mechanisms of the following introspection p
 - [2025-01-04] Match the style of surrounding code. Consistency within a file trumps external standards.
 
 - [2025-01-04] Fix bugs immediately when found.
+
+- [2025-01-07] When saving to a .json file with indentations, always use indent = 4.
+
+- [2026-01-07] Always use `pathlib.Path` for reading/writing files.
 
 
 ## Naming & comments
