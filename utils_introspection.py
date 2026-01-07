@@ -56,13 +56,13 @@ def no_steer_rollout(
     num_trials: int = 100,
     batch_size: int = 64,
     max_new_tokens: int = 128,
-) -> dict[str, list[str]]:
+) -> list[str]:
     """Run introspection trials without steering (control condition).
 
     Batches over different trial indices with right-aligned (left-padded) sequences.
 
     Returns:
-        Dict mapping str(trial_idx) -> list of rollout strings.
+        List of rollout strings, one per trial.
     """
     device = next(model.parameters()).device
     save_dir = Path(save_dir)
@@ -83,8 +83,8 @@ def no_steer_rollout(
             for tidx in trial_idx
         }
 
-        # Initialize results
-        results: dict[str, list[str]] = {str(tidx): [] for tidx in trial_idx}
+        # Pre-allocate results to preserve trial order
+        results: list[str | None] = [None] * num_trials
 
         # Assign trial indices to each trial number (cycling through trial_idx)
         trial_assignments = [
@@ -113,11 +113,11 @@ def no_steer_rollout(
                     max_new_tokens=max_new_tokens,
                 )
 
-            # Decode and store results by trial index
-            for i, (_, tidx) in enumerate(batch_assignments):
+            # Decode and store results at correct trial index
+            for i, (trial_num, _) in enumerate(batch_assignments):
                 full_text = tokenizer.decode(output_ids[i], skip_special_tokens=True)
                 parts = full_text.split("\nmodel\n")
-                results[str(tidx)].append(parts[2] if len(parts) >= 2 else full_text)
+                results[trial_num] = parts[2] if len(parts) >= 2 else full_text
 
     finally:
         # Restore original tokenizer settings

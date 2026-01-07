@@ -4,6 +4,8 @@ from textwrap import dedent
 from pathlib import Path
 from typing import Literal, Sequence
 
+import numpy as np
+import matplotlib.pyplot as plt
 from caller import RetryConfig, Response
 
 RETRY_CONFIG = RetryConfig(
@@ -207,6 +209,7 @@ async def judge_main(
 ) -> dict[JudgeType, dict[str, list[bool | None]]]:
 
     all_results = {}
+    base_path.mkdir(parents=True, exist_ok=True)
 
     for jt in judge_type:
         match jt:
@@ -233,7 +236,173 @@ async def judge_main(
 
         with open(base_path / f"judgments_{jt}.json", "w") as f:
             json.dump(judgments, f, indent=4)
-        
+
         all_results[jt] = judgments
 
     return all_results
+
+
+def _compute_rate(judgments: list[bool | None]) -> float:
+    """Compute rate of True values, ignoring None."""
+    valid = [j for j in judgments if j is not None]
+    return sum(valid) / len(valid) if valid else 0.0
+
+
+def _compute_and_rate(j1: list[bool | None], j2: list[bool | None]) -> float:
+    """Compute rate where both j1[i] AND j2[i] are True (element-wise)."""
+    valid_and = [
+        (a and b)
+        for a, b in zip(j1, j2)
+        if a is not None and b is not None
+    ]
+    return sum(valid_and) / len(valid_and) if valid_and else 0.0
+
+
+def plot_introspection_rates(
+    steer_judgments: dict[JudgeType, dict[str, list[bool | None]]],
+    no_steer_judgments: dict[JudgeType, dict[str, list[bool | None]]],
+    key_to_word: dict[str, str] | None = None,
+    save_path: Path | None = None,
+    title: str = "Introspection Rates",
+    figsize: tuple[float, float] = (14, 6),
+):
+    """Plot introspection rates for steered and no-steer conditions.
+
+    For steered condition, plots per word:
+    - Detection rate
+    - Detection + Identification rate
+    - Detection + Coherence rate
+    - Detection + Identification + Coherence rate
+
+    For no-steer condition, plots horizontal lines for:
+    - False positive detection rate
+    - False positive detection + coherence rate
+
+    Args:
+        steer_judgments: Output from judge_main for steered rollouts.
+            Maps judge_type -> key -> list of judgments.
+        no_steer_judgments: Output from judge_main for no-steer rollouts.
+        key_to_word: Maps key (e.g. "Algorithms_4.0") to word ("Algorithms").
+            If None, uses keys directly as labels.
+        save_path: If provided, saves figure to this path.
+        title: Plot title.
+        figsize: Figure size (width, height).
+
+    Returns:
+        matplotlib Figure object.
+    """
+    detection = steer_judgments.get("detection", {})
+    detection_id = steer_judgments.get("detection_identification", {})
+    coherence = steer_judgments.get("coherence", {})
+
+    # Determine words and grouping
+    all_keys = set(detection.keys()) | set(detection_id.keys())
+    if key_to_word is None:
+        key_to_word = {k: k for k in all_keys}
+
+    words = sorted(set(key_to_word.values()))
+
+    # Group keys by word
+    word_to_keys: dict[str, list[str]] = {w: [] for w in words}
+    for key, word in key_to_word.items():
+        if key in all_keys:
+            word_to_keys[word].append(key)
+
+    # Compute rates for each word
+    detection_rates = []
+    detection_id_rates = []
+    detection_coherent_rates = []
+    detection_id_coherent_rates = []
+
+    for word in words:
+        keys = word_to_keys[word]
+
+        # Aggregate judgments across all keys for this word
+        word_detection = [j for k in keys for j in detection.get(k, [])]
+        word_detection_id = [j for k in keys for j in detection_id.get(k, [])]
+
+        detection_rates.append(_compute_rate(word_detection))
+        detection_id_rates.append(_compute_rate(word_detection_id))
+
+        # For AND rates, compute element-wise within each key then aggregate
+        det_coh_vals = []
+        det_id_coh_vals = []
+        for k in keys:
+            det_k = detection.get(k, [])
+            det_id_k = detection_id.get(k, [])
+            coh_k = coherence.get(k, [])
+            for i in range(min(len(det_k), len(coh_k))):
+                if det_k[i] is not None and coh_k[i] is not None:
+                    det_coh_vals.append(det_k[i] and coh_k[i])
+            for i in range(min(len(det_id_k), len(coh_k))):
+                if det_id_k[i] is not None and coh_k[i] is not None:
+                    det_id_coh_vals.append(det_id_k[i] and coh_k[i])
+
+        detection_coherent_rates.append(
+            sum(det_coh_vals) / len(det_coh_vals) if det_coh_vals else 0.0
+        )
+        detection_id_coherent_rates.append(
+            sum(det_id_coh_vals) / len(det_id_coh_vals) if det_id_coh_vals else 0.0
+        )
+
+    # Compute false positive rates (no-steer)
+    ns_detection = no_steer_judgments.get("detection", {})
+    ns_coherence = no_steer_judgments.get("coherence", {})
+
+    all_ns_detection = [j for vals in ns_detection.values() for j in vals]
+    fp_detection = _compute_rate(all_ns_detection)
+
+    # FP detection + coherence (element-wise AND)
+    fp_det_coh_vals = []
+    for key in ns_detection:
+        det = ns_detection.get(key, [])
+        coh = ns_coherence.get(key, [])
+        for i in range(min(len(det), len(coh))):
+            if det[i] is not None and coh[i] is not None:
+                fp_det_coh_vals.append(det[i] and coh[i])
+    fp_detection_coherent = (
+        sum(fp_det_coh_vals) / len(fp_det_coh_vals) if fp_det_coh_vals else 0.0
+    )
+
+    # Add "No Steer" as a separate column
+    words_with_fp = ["No Steer"] + words
+    x = np.arange(len(words_with_fp))
+    width = 0.2
+
+    # Prepend FP rates (use 0 for metrics that don't apply to no-steer)
+    detection_rates = [fp_detection] + detection_rates
+    detection_id_rates = [0.0] + detection_id_rates  # No ID for no-steer
+    detection_coherent_rates = [fp_detection_coherent] + detection_coherent_rates
+    detection_id_coherent_rates = [0.0] + detection_id_coherent_rates  # No ID for no-steer
+
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.bar(x - 1.5 * width, detection_rates, width,
+           label="Detection", color="#1f77b4")
+    ax.bar(x - 0.5 * width, detection_id_rates, width,
+           label="Detection + ID", color="#ff7f0e")
+    ax.bar(x + 0.5 * width, detection_coherent_rates, width,
+           label="Detection + Coherent", color="#2ca02c")
+    ax.bar(x + 1.5 * width, detection_id_coherent_rates, width,
+           label="Detection + ID + Coherent", color="#d62728")
+
+    # Add vertical separator after "No Steer"
+    ax.axvline(0.5, color="gray", linestyle="-", alpha=0.3)
+
+    ax.set_xlabel("Word")
+    ax.set_ylabel("Rate")
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(words_with_fp, rotation=45, ha="right")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+
+    if save_path:
+        save_path = Path(save_path)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved {save_path}")
+
+    return fig
