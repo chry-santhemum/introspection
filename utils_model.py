@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Union, Sequence
 from jaxtyping import Float, Int
 from datasets import Dataset
 
@@ -85,7 +85,7 @@ def get_layer_at_fraction(model, fraction: float) -> int:
 
 ComponentType = Literal["resid", "attn", "mlp"]
 
-def get_all_component_names(model, components: list[ComponentType]) -> dict[tuple[ComponentType, int], str]:
+def get_all_component_names(model, components: Sequence[ComponentType]) -> dict[tuple[ComponentType, int], str]:
     """Get module names for all components at all layers.
 
     Returns:
@@ -313,7 +313,7 @@ class PatchConfig:
     def from_modules(
         cls,
         source: Activations,
-        modules: list[tuple[ComponentType, int]],
+        modules: Sequence[tuple[ComponentType, int]],
         tokens: TokenSpec,
     ) -> "PatchConfig":
         """Create PatchConfig with same tokens for all modules."""
@@ -372,7 +372,7 @@ def fwd_record_all(
     model,
     inputs: dict[str, Tensor],
     hooks: list[FwdHook],
-    components: list[ComponentType] = ["resid", "attn", "mlp"],
+    components: Sequence[ComponentType] = ("resid", "attn", "mlp"),
 ) -> Activations:
     """Forward pass recording activations at all layers for specified components."""
     device = next(model.parameters()).device
@@ -426,7 +426,7 @@ def compute_mean_activations(
     num_tokens: int = 100_000,
     seq_len: int = 1024,
     text_column: str = "text",
-    components: list[ComponentType] = ["resid", "attn", "mlp"],
+    components: Sequence[ComponentType] = ("resid", "attn", "mlp"),
 ) -> Activations:
     """Compute mean activations across dataset, returned as Activations with seq_len=1."""
     device = next(model.parameters()).device

@@ -2,7 +2,7 @@
 import json
 from textwrap import dedent
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 import matplotlib.pyplot as plt
 
 from caller import AutoCaller, RetryConfig, Response
@@ -149,9 +149,9 @@ def parse_binary_response(resp: Response) -> bool | None:
 
 async def judge_introspection(
     caller,
-    rollouts: dict[str, list[str]],  # word -> list of rollout texts
+    rollouts: dict[str, list[str]],  # key -> list of rollout texts
     judge_prompt: str,
-    key_to_word: dict[str, str]|None,
+    key_to_word: dict[str, str]|None,  # key -> word
     judge_model: str = "openai/gpt-5-mini",
     max_par: int = 512,
     max_tokens: int = 8192,
@@ -191,35 +191,44 @@ async def judge_introspection(
 
     return judgments
 
+JudgeType = Literal["detection_identification", "detection", "coherence"]
 
 async def judge_main(
     caller,
     steer_results: dict[str, list[str]],
     base_path: Path,
     key_to_word: dict[str, str]|None = None,
-    judge_type: Literal["detection_identification", "detection"] = "detection_identification",
+    judge_type: Sequence[JudgeType] = ("detection_identification", "coherence"),
     judge_model: str = "openai/gpt-5-mini",
     max_par: int = 512,
     max_tokens: int = 8192,
     reasoning: str | int = "medium",
     enable_cache: bool = True,
 ) -> dict[str, float]:
-    judge_prompt = JUDGE_DETECTION_IDENTIFICATION if judge_type == "detection_identification" else JUDGE_DETECTION
 
-    judgments_detection = await judge_introspection(
-        caller,
-        steer_results,
-        judge_prompt=judge_prompt,
-        key_to_word=key_to_word,
-        judge_model=judge_model,
-        max_par=max_par,
-        max_tokens=max_tokens,
-        reasoning=reasoning,
-        enable_cache=enable_cache,
-    )
+    for jt in judge_type:
+        match jt:
+            case "detection_identification":
+                judge_prompt = JUDGE_DETECTION_IDENTIFICATION
+            case "detection":
+                judge_prompt = JUDGE_DETECTION
+            case "coherence":
+                judge_prompt = JUDGE_COHERENCE
+            case _:
+                raise ValueError(f"Invalid judge type: {jt}")
 
-    with open(base_path / "judgments_detection.json", "w") as f:
-        json.dump(judgments_detection, f, indent=4)
+        judgments = await judge_introspection(
+            caller,
+            steer_results,
+            judge_prompt=judge_prompt,
+            key_to_word=key_to_word,
+            judge_model=judge_model,
+            reasoning=reasoning,
+            enable_cache=enable_cache,
+        )
+
+        with open(base_path / f"judgments_{jt}.json", "w") as f:
+            json.dump(judgments, f, indent=4)
 
     judgments_coherence = await judge_introspection(
         caller,
