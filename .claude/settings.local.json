@@ -1,37 +1,105 @@
 {
   "permissions": {
     "allow": [
-      "mcp__ide__getDiagnostics",
-      "Bash(python -m py_compile:*)",
-      "Bash(python -c:*)",
-      "Bash(source ~/.venv/bin/activate)",
+      "Bash(echo:*)",
+      "Bash(source:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(python3 <<:*)",
+      "WebFetch(domain:inspect.aisi.org.uk)",
+      "Bash(uv sync:*)",
+      "Bash(uv venv:*)",
+      "Bash(uv pip install:*)",
+      "Bash(chmod:*)",
+      "Bash(inspect eval --help:*)",
+      "Bash(pkill:*)",
+      "Bash(__NEW_LINE__ export OPENAI_BASE_URL=\"http://127.0.0.1:8020/v1\")",
+      "Bash(export OPENAI_API_KEY=\"dummy\")",
+      "Bash(__NEW_LINE__ cd /workspace/petri)",
+      "Bash(inspect eval:*)",
+      "Bash(python /workspace/olmo/filter_petri_instructions.py:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(tree:*)",
+      "Bash(wc:*)",
+      "Bash(inspect info:*)",
+      "Bash(PYTHONPATH=/workspace/olmo inspect eval:*)",
+      "Bash(PYTHONPATH=/workspace/olmo python:*)",
+      "Bash(pgrep:*)",
+      "Bash(bash run_sycophancy_evals.sh:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(fuser:*)",
+      "Bash(ps:*)",
+      "Bash(kill:*)",
+      "Bash(git -C /workspace/olmo log:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(printf:*)",
+      "Bash(tput:*)",
       "Bash(grep:*)",
-      "Bash(ls:*)"
+      "WebSearch",
+      "Bash(head:*)",
+      "Bash(pip show:*)",
+      "Bash(OPENAI_API_KEY=dummy python:*)",
+      "Bash(OPENAI_API_KEY=dummy HF_TOKEN=dummy python:*)",
+      "Bash(uv add:*)",
+      "Bash(uv run python:*)",
+      "Bash(bash -n:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./run_dpo_evals.sh:*)",
+      "Bash(export PYTHONPATH=/workspace/olmo:$PYTHONPATH:*)",
+      "Bash(vllm serve --help:*)",
+      "Bash(unzip:*)",
+      "Bash(find:*)",
+      "Bash(inspect --help:*)",
+      "Bash(inspect score --help:*)",
+      "Bash(inspect score:*)",
+      "Bash(for bias in positive_bias negative_bias ownership_bias disownership)",
+      "Bash(do echo -n \"$bias: \")",
+      "Bash(done)",
+      "Bash(make style:*)",
+      "Bash(make quality:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0,1,2 bash:*)",
+      "Bash(cd:*)",
+      "Bash(git show:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git push:*)",
+      "Bash(git fetch:*)",
+      "Bash(git log:*)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(git rm:*)",
+      "Bash(env)",
+      "Bash(lsof:*)",
+      "Bash(ss:*)",
+      "Bash(for d in /workspace/olmo/dpo_filter_data/16K-persona-{50.0,20.0,10.0,5.0}pct-prune)",
+      "WebFetch(domain:docs.vllm.ai)",
+      "Bash(git submodule status:*)",
+      "Bash(uv run ruff check:*)",
+      "Bash(git diff:*)"
     ]
   },
-  "enableAllProjectMcpServers": true,
-  "enabledMcpjsonServers": [
-    "orchestra-mcp"
-  ],
   "hooks": {
     "Stop": [
       {
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/bell.sh"
+            "command": "timeout 2 sh -c 'for t in /dev/pts/*; do [ -w \"$t\" ] && printf \"\\a\" > \"$t\" 2>/dev/null; done' 2>/dev/null; true"
           }
         ]
       }
     ],
-    "SubagentStop": [
+    "Notification": [
       {
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/bell.sh"
+            "command": "timeout 2 sh -c 'for t in /dev/pts/*; do [ -w \"$t\" ] && printf \"\\a\" > \"$t\" 2>/dev/null; done' 2>/dev/null; true"
           }
         ]
       }
